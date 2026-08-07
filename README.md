@@ -10,7 +10,7 @@ No `llama.cpp`, no Python runtime — one static binary, plus a library you can 
 
 Runs six transformer families today:
 
-| Family | Backend | Notes |
+| Current Model Families | Backend | Notes |
 |---|---|---|
 | Llama / Mistral / Qwen2 / Qwen2.5 / SmolLM2 | CPU + Metal GPU (fused) | bit-identical CPU↔GPU |
 | Gemma-2 | CPU | embed scale, GeGLU, attn/final soft-cap, sandwich norms |
