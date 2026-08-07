@@ -6,6 +6,11 @@ in their native quantized form and dequantized inside the compute kernels.
 
 No `llama.cpp`, no Python runtime — one static binary, plus a library you can build on.
 
+> 📖 **New here? Read [The HOS Book](docs/HOS_BOOK.md).** It opens with how HOS
+> compares to `llama.cpp`, llm.c, transformers, and PyTorch, then walks from a
+> five-minute quick start through the engine internals and the research the whole
+> thing is built on.
+
 ## Status
 
 Runs six transformer families today:
