@@ -43,8 +43,8 @@ struct Opts {
 fn usage() -> ! {
     eprintln!("flwr — talk to a model.   Powered by HOS.");
     eprintln!();
-    eprintln!("  flwr run <model> [--gpu] [-p \"prompt\"] [-n N] [--temp T] [--seed S]");
-    eprintln!("  flwr serve <model> [--gpu] [--host 127.0.0.1] [--port 11434]");
+    eprintln!("  flwr run <model> [--cpu] [-p \"prompt\"] [-n N] [--temp T] [--seed S]");
+    eprintln!("  flwr serve <model> [--cpu] [--host 127.0.0.1] [--port 11434]");
     eprintln!("  flwr pull <hf-repo|gguf-url> [--revision main] [--name X]");
     eprintln!("  flwr list");
     eprintln!("  flwr show <name>");
@@ -55,7 +55,8 @@ fn usage() -> ! {
     eprintln!("<model> is a path (.flwr or .hos), a name in the store (flwr pull), or a");
     eprintln!("bare name resolved from $HOS_MODELS_DIR, ~/Documents/hos/models, ~/.hos/models.");
     eprintln!();
-    eprintln!("quickstart:  flwr run ~/Documents/hos/models/<model>.hos --gpu");
+    eprintln!("Metal GPU is the default on Apple Silicon (--cpu to force CPU); x86 runs on");
+    eprintln!("AVX2-accelerated CPU automatically. quickstart:  flwr run flwr-bloom");
     std::process::exit(1);
 }
 
@@ -71,7 +72,10 @@ fn parse() -> Opts {
         rep_penalty: 1.1,
         repeat_last_n: 64,
         seed: 42,
-        gpu: false,
+        // Default to the Metal GPU on Apple Silicon (where it is ~6x faster and
+        // always present) so Mac users get it without knowing the flag exists.
+        // `--cpu` forces CPU. Elsewhere Metal is not built, so this stays false.
+        gpu: cfg!(all(target_os = "macos", target_arch = "aarch64")),
         host: "127.0.0.1".to_string(),
         port: 11434, // the de-facto local-LLM port — drop-in for existing clients
         revision: "main".to_string(),
@@ -106,6 +110,7 @@ fn parse() -> Opts {
             "--type" | "-t" => o.qtype = it.next().unwrap_or(o.qtype),
             "--awq" => o.awq = true,
             "--gpu" => o.gpu = true,
+            "--cpu" => o.gpu = false,
             other if !other.starts_with('-') && o.model.is_none() => {
                 o.model = Some(other.to_string())
             }
