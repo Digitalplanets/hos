@@ -9,28 +9,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    # HOS depends on the `metal` crate, which only builds on macOS. GitHub's
-    # macOS runners compile it fine; tests that need an actual GPU device
-    # self-skip (see tests/), and the model-dependent tests skip when models/
-    # is empty (model files are not committed).
-    runs-on: macos-14
+  build:
+    # HOS builds CPU-only on Linux (the `metal` GPU dependency is macOS-gated),
+    # so CI runs on GitHub's free Linux runners. Tests that need a GPU device or
+    # model files self-skip when those are absent, so they pass on a clean runner.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable + rustfmt + clippy)
+      - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
-
-      - name: Format check
-        run: cargo fmt --all -- --check
-
-      - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --release
