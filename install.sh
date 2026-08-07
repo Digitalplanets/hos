@@ -20,8 +20,10 @@ mkdir -p "$BINDIR"
 
 asset=""
 case "$OS-$ARCH" in
-  Darwin-arm64)  asset="flwr-macos-arm64.tar.gz" ;;
-  Darwin-x86_64) asset="flwr-macos-x86_64.tar.gz" ;;
+  Darwin-arm64)         asset="flwr-macos-arm64.tar.gz" ;;
+  Darwin-x86_64)        asset="flwr-macos-x86_64.tar.gz" ;;
+  Linux-x86_64)         asset="flwr-linux-x86_64.tar.gz" ;;
+  Linux-aarch64|Linux-arm64) asset="flwr-linux-arm64.tar.gz" ;;
 esac
 
 if [ -n "$asset" ]; then
