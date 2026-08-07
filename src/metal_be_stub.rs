@@ -58,6 +58,15 @@ impl Gpu {
     pub fn matvec(&self, _w: &GpuMatrix, _x: &[f32]) -> Vec<f32> {
         unreachable!("{NO_GPU}")
     }
+    pub fn matmul_q4k_prefill_into(
+        &self,
+        _w: &GpuMatrix,
+        _x: &[f32],
+        _ntok: usize,
+        _out: &mut [f32],
+    ) {
+        unreachable!("{NO_GPU}")
+    }
     // keyed GEMM entry points used by tensor.rs autograd (gated behind the GPU
     // residency flag, so unreachable off macOS — present only so the lib builds).
     pub fn matmul_f32_keyed(
