@@ -283,4 +283,4 @@ decodes: `flwr quantize` derives a smaller GGUF and preserves perplexity.
 
 ## License
 
-MIT
+NA'AT Keystone License (Open Source)
