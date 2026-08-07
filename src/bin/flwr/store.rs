@@ -116,16 +116,14 @@ pub fn pull(spec: &str, revision: &str, name_override: Option<&str>) {
     {
         pull_gguf_url(spec, name_override);
     } else if !spec.contains('/') {
-        // A bare name (no org/ prefix) resolves against YOUR hub when
-        // FLWR_REGISTRY is set — `FLWR_REGISTRY=https://you.example.com flwr
-        // pull flwr-bloom` fetches the capsule from your site, not HF. Falls
-        // back to HF if the env var is unset (nothing to resolve against).
-        match std::env::var("FLWR_REGISTRY") {
-            Ok(reg) if !reg.trim().is_empty() => {
-                pull_registry(reg.trim().trim_end_matches('/'), spec, name_override)
-            }
-            _ => pull_hf(spec, revision, name_override),
-        }
+        // A bare name resolves against the flwr hub. Defaults to the flwr model
+        // registry (https://www.flwr.systems) so `flwr pull flwr-bloom` works
+        // out of the box; set FLWR_REGISTRY to point at your own hub instead.
+        let reg = std::env::var("FLWR_REGISTRY")
+            .ok()
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| "https://www.flwr.systems".to_string());
+        pull_registry(reg.trim().trim_end_matches('/'), spec, name_override);
     } else {
         pull_hf(spec, revision, name_override);
     }
