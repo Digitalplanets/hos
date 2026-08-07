@@ -1,0 +1,4 @@
+# golden token-id stream for the HOS regression safety net
+# model=flwr_1b_run.hos prompt="The capital of France is" max_tokens=16 temp=0 seed=42
+# 16 ids, comma-separated:
+12366,13,578,8753,4221,374,279,4033,4221,315,279,3224,13,578,3224,374

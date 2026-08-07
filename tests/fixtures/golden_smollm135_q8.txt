@@ -1,0 +1,4 @@
+# golden token-id stream for the HOS regression safety net
+# model=SmolLM2-135M-Instruct-Q8_0.gguf prompt="The history of computing began with" max_tokens=16 temp=0 seed=42
+# 16 ids, comma-separated:
+260,10531,282,260,808,6318,2583,28,11286,57,3144,28,281,216,33,41

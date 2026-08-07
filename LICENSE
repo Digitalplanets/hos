@@ -1,0 +1,165 @@
+The Na'at Keystone License
+Version 1.0
+
+  na'at (Yucatec Maya): to understand, to solve, to figure the thing out.
+  keystone: the stone at the crown of an arch that locks every other stone
+  in place; remove it and the arch falls.
+
+  Intelligence is the keystone. Understanding is the craft. This license
+  keeps both in the commons.
+
+Copyright (c) 2026 Hue. Every freedom not withheld below is granted below.
+
+
+PREAMBLE
+
+A license for builders, learners, workers, artists, researchers, small teams,
+independent labs, and companies who believe intelligence should remain a
+practice people can touch.
+
+This work is released for the new era of making.
+
+You are free to use it, study it, change it, train with it, build from it,
+self-host it, teach with it, ship with it, and sell what you create with it.
+
+You may build products, tools, models, agents, interfaces, research systems,
+education systems, and infrastructure from this work.
+
+The only covenant is fairness:
+
+Give credit.
+Preserve provenance.
+Do not erase the commons.
+Do not pretend shared work was born closed.
+Do not use openness as a ladder and then pull the ladder away.
+
+Artificial intelligence is not a priesthood.
+It is a trade.
+It is a craft.
+It is a public instrument.
+
+This license exists so that people can learn the machine, shape the machine,
+question the machine, and build with the machine without asking permission
+from a permanent ruling class.
+
+Build freely.
+Attribute honestly.
+Return improvements to the shared core when you offer the core back to the
+world as a service.
+Protect the user's agency.
+Keep the craft alive.
+
+The Preamble above states the intent of this license. The Terms below give it
+force. Where the Terms are silent, read them in the spirit of the Preamble.
+
+
+TERMS AND CONDITIONS
+
+0. Definitions
+
+  "The Work" means the software, models, weights, formats, documentation, and
+  other material distributed under this License by the Licensor.
+
+  "The Core" means the Work as released by the Licensor, and any part of it,
+  as distinct from material you independently author and add.
+
+  "Derivative" means any work that copies, modifies, translates, adapts,
+  fine-tunes, distills, quantizes, or otherwise builds upon the Work or the
+  Core.
+
+  "You" means any person or entity exercising rights under this License.
+
+  "Provenance" means the origin, authorship, and lineage information carried by
+  the Work, including embedded lineage cards, model cards, manifests, and
+  metadata that record where the Work and its parts came from.
+
+  "Offer as a Service" means to make the functionality of the Work or a
+  modified Core available to third parties over a network, whether hosted,
+  managed, or provided as an interface or API, with or without charge.
+
+1. Grant of Rights
+
+  Subject to the conditions in Section 2, the Licensor grants You a perpetual,
+  worldwide, non-exclusive, royalty-free, irrevocable (except as stated in
+  Section 7) license to:
+
+    a. use, run, and self-host the Work, for any purpose, including commercial;
+    b. study and inspect the Work in full;
+    c. reproduce and distribute the Work and Derivatives;
+    d. modify the Work and create Derivatives;
+    e. train, fine-tune, and derive models using the Work;
+    f. sell, license, and provide as a service the products You create; and
+    g. teach, publish, and share what You learn from the Work.
+
+  You may place Your own terms on the independent material You add, provided You
+  do not restrict the freedoms this License grants in the Core.
+
+2. Conditions (the Covenant)
+
+  Your rights under Section 1 are conditioned on all of the following.
+
+  2.1 Credit. You must retain, in source form and in the documentation or
+  credits of any product You distribute or Offer as a Service, the copyright
+  notice, this License, and a reasonable identification of the Work and its
+  origin.
+
+  2.2 Provenance. You must not remove, falsify, or obscure the Provenance
+  carried by the Work. Derivatives must preserve the recorded lineage back to
+  the Work, and may add to it, but may not break or overwrite it.
+
+  2.3 Source on Service. If You Offer as a Service the Work or a modified Core,
+  You must make the corresponding source of Your modifications to the Core
+  available to the recipients of that service, under this License, at no charge
+  and by a reasonable means. Independent material You author that is not a
+  modification of the Core is not covered by this condition.
+
+  2.4 Honesty. You must not represent the Work or a Derivative as Your own
+  original and closed creation, nor imply that shared work was born closed.
+
+  2.5 User Agency. You must not use technical measures to deny an end user an
+  ability to run, inspect, export, or move their own data or models that the
+  Work itself provided to them.
+
+3. Trademarks
+
+  This License grants no rights in the names, logos, or trademarks of the
+  Licensor, except for the limited use required by Section 2.1 to give credit
+  and describe origin. Do not use them to imply endorsement.
+
+4. Preservation of the Commons
+
+  You may license Your Derivatives as You wish, consistent with Section 2. You
+  may not relicense or redistribute the unmodified Core under terms that revoke
+  the freedoms granted here. The Core remains free for everyone who receives it.
+
+5. Disclaimer of Warranty
+
+  THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. YOU BEAR THE ENTIRE
+  RISK OF USING THE WORK.
+
+6. Limitation of Liability
+
+  TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL THE LICENSOR BE
+  LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT,
+  OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE WORK OR THE USE
+  OR OTHER DEALINGS IN THE WORK.
+
+7. Termination and Reinstatement
+
+  If You materially breach this License and do not cure the breach within 30
+  days of becoming aware of it, Your rights under Section 1 terminate for the
+  material in breach. Your rights are reinstated automatically upon cure. The
+  rights of those who received the Work or a Derivative from You in good faith
+  are not terminated by Your breach.
+
+8. Acceptance
+
+  You are not required to accept this License in order to receive a copy of the
+  Work. However, nothing else grants You permission to use, modify, or
+  distribute the Work or any Derivative. By exercising any right in Section 1,
+  You accept and agree to be bound by this License.
+
+
+Build freely. Attribute honestly. Keep the craft alive.

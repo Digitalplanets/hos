@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  UTI declaration for the .flwr model type, as a specialization of the .hos capsule.
+  Paste these keys into a flwr.app bundle's Info.plist (a CLI can't own a UTI directly).
+  .flwr conforms to the .hos type, encoding the "everything is a .hos under the hood"
+  invariant at the OS type-system level.
+-->
+<plist version="1.0">
+<dict>
+  <!-- The sovereign base type: the HOS capsule. -->
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>os.hueman.hos.capsule</string>
+      <key>UTTypeDescription</key>
+      <string>HOS model capsule</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>hos</string></array>
+      </dict>
+    </dict>
+    <!-- flwr's label: a specialization that CONFORMS TO the .hos type. -->
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>os.hueman.flwr.model</string>
+      <key>UTTypeDescription</key>
+      <string>flwr model (Powered by HOS)</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>os.hueman.hos.capsule</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>flwr</string></array>
+      </dict>
+    </dict>
+  </array>
+  <!-- flwr handles both. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>flwr / HOS model</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>os.hueman.flwr.model</string>
+        <string>os.hueman.hos.capsule</string>
+      </array>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+    </dict>
+  </array>
+</dict>
+</plist>

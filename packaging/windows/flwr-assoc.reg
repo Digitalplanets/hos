@@ -1,0 +1,23 @@
+Windows Registry Editor Version 5.00
+
+; Associate .flwr and .hos model capsules with the flwr binary.
+; Edit the path below to where flwr.exe lives (e.g. %USERPROFILE%\.cargo\bin\flwr.exe),
+; then double-click this .reg file to apply (per-user, no admin needed).
+;
+; .flwr is a cosmetic alias over the .hos format — both are the same capsule, so
+; both point at the same handler. The engine identifies the file by its magic bytes.
+
+[HKEY_CURRENT_USER\Software\Classes\.flwr]
+@="flwr.model"
+
+[HKEY_CURRENT_USER\Software\Classes\.hos]
+@="flwr.model"
+
+[HKEY_CURRENT_USER\Software\Classes\flwr.model]
+@="HOS model capsule (Powered by HOS)"
+
+[HKEY_CURRENT_USER\Software\Classes\flwr.model\DefaultIcon]
+@="%USERPROFILE%\\.cargo\\bin\\flwr.exe,0"
+
+[HKEY_CURRENT_USER\Software\Classes\flwr.model\shell\open\command]
+@="\"%USERPROFILE%\\.cargo\\bin\\flwr.exe\" run \"%1\" --gpu"

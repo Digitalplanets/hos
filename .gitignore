@@ -1,0 +1,18 @@
+/target
+*.gguf
+/models/
+/conversations/
+.DS_Store
+/venv
+__pycache__/
+
+# nested build / env artifacts (any depth)
+**/target/
+**/.venv/
+**/node_modules/
+**/*.egg-info/
+
+# model capsules & generated corpora (large, regenerable)
+*.hos
+/data/
+/.claude/
