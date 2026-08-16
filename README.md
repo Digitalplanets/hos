@@ -1,10 +1,10 @@
 # HOS
 
-A from-scratch local LLM inference engine, written in Rust. Loads GGUF models and
+A from-scratch local LLM inference engine. Loads GGUF or other models and
 runs them on CPU (multithreaded) or Apple Silicon GPU (Metal), with weights kept
 in their native quantized form and dequantized inside the compute kernels.
 
-No `llama.cpp`, no Python runtime — one static binary, plus a library you can build on.
+No `llama.cpp`, no Python runtime. One static binary with a library you can build on.
 
 > 📖 **New here? Read [The HOS Book](docs/HOS_BOOK.md).** It opens with how HOS
 > compares to `llama.cpp`, llm.c, transformers, and PyTorch, then walks from a
@@ -29,7 +29,7 @@ verified bit-identical between the CPU and GPU backends on the GPU families.
 
 The tokenizer is **byte-exact**: it reproduces the GPT-2-family pre-tokenization
 and dispatches the right variant (`gpt-2` / `qwen2` / `llama-bpe`) from the
-model's metadata. Loading and parsing are **fully fallible** — a missing,
+model's metadata. Loading and parsing are "fully fallible", meaning a missing,
 malformed, or unsupported model returns a clean error instead of panicking.
 
 Hybrid SSM/Mamba models (Qwen3.5 `qwen35`) are detected and inspectable
