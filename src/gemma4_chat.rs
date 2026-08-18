@@ -122,6 +122,10 @@ impl Session {
 
         let mut out_ids: Vec<u32> = Vec::new();
         let mut prev = String::new();
+        // Gemma-4 prepends a bare `thought` line before its answer. Buffer the first
+        // line and drop it if that's all it is, so the transcript starts at the reply.
+        let mut head_buf = String::new();
+        let mut head_done = false;
         for _ in 0..gp.n_predict.max(1) {
             let start = out_ids.len().saturating_sub(gp.repeat_last_n);
             let recent = &out_ids[start..];
@@ -141,10 +145,37 @@ impl Session {
             // UTF-8-safe streaming: only slice when the new decode extends the prior.
             let now = tok.decode(&out_ids, true);
             if now.len() > prev.len() && now.starts_with(&prev) {
-                on_piece(&now[prev.len()..]);
+                let piece = &now[prev.len()..];
+                if head_done {
+                    on_piece(piece);
+                } else {
+                    head_buf.push_str(piece);
+                    if let Some(nl) = head_buf.find('\n') {
+                        if head_buf[..nl].trim().eq_ignore_ascii_case("thought") {
+                            let rest = head_buf[nl + 1..].to_string();
+                            if !rest.is_empty() {
+                                on_piece(&rest);
+                            }
+                        } else {
+                            let all = head_buf.clone();
+                            on_piece(&all);
+                        }
+                        head_done = true;
+                        head_buf.clear();
+                    } else if head_buf.len() > 40 {
+                        let all = head_buf.clone();
+                        on_piece(&all);
+                        head_done = true;
+                        head_buf.clear();
+                    }
+                }
             }
             prev = now;
             logits = m.decode_step(&mut cache, next, gref);
+        }
+        // Flush a short answer that never contained a newline (so it wasn't a header).
+        if !head_done && !head_buf.is_empty() {
+            on_piece(&head_buf);
         }
         out_ids.len()
     }
