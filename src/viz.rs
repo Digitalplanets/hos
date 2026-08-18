@@ -20,6 +20,12 @@ fn light_mode() -> bool {
             Ok("dark") => return false,
             _ => {}
         }
+        // Ask the terminal for its actual background color (OSC 11). Terminal.app
+        // and iTerm2 answer this even though Terminal.app never sets COLORFGBG, so a
+        // white background flips to the light palette automatically.
+        if let Some(lum) = query_bg_luminance() {
+            return lum > 0.5;
+        }
         if let Ok(v) = std::env::var("COLORFGBG") {
             if let Some(bg) = v.rsplit(';').next() {
                 if let Ok(n) = bg.trim().parse::<i32>() {
@@ -30,6 +36,60 @@ fn light_mode() -> bool {
         }
         false
     })
+}
+
+/// Query the terminal's background color via OSC 11 (`ESC ] 11 ; ?`), returning its
+/// perceived luminance in 0.0..=1.0, or None when there's no TTY / no reply. Uses
+/// `stty` for raw mode + a ~0.2s read timeout (min 0 time 2), then restores the
+/// terminal. Zero-dep; falls through cleanly on terminals that don't answer.
+fn query_bg_luminance() -> Option<f32> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    // Save current termios (and confirm we're on a TTY: stty fails otherwise).
+    let saved = Command::new("stty")
+        .arg("-g")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())?;
+    let saved = saved.trim().to_string();
+    // Raw, no echo, non-blocking read with a 0.2s deadline.
+    let _ = Command::new("stty")
+        .args(["raw", "-echo", "min", "0", "time", "2"])
+        .status();
+    print!("\x1b]11;?\x07"); // ask for the background color
+    let _ = std::io::stdout().flush();
+    let mut buf = [0u8; 64];
+    let n = std::io::stdin().read(&mut buf).unwrap_or(0);
+    // Always restore the terminal, whatever happened.
+    let _ = Command::new("stty").arg(&saved).status();
+    if n == 0 {
+        return None;
+    }
+    // Reply looks like: ESC ] 11 ; rgb:RRRR/GGGG/BBBB  (BEL or ST terminated).
+    let s = String::from_utf8_lossy(&buf[..n]);
+    let rest = &s[s.find("rgb:")? + 4..];
+    let mut it = rest.split('/');
+    let comp = |p: Option<&str>| -> Option<f32> {
+        let hex: String = p?
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        if hex.is_empty() {
+            return None;
+        }
+        let v = u32::from_str_radix(&hex, 16).ok()?;
+        // 4 hex digits => 16-bit (/65535); 1-2 digits => 8-bit (/255).
+        let max = if hex.len() >= 3 { 65535.0 } else { 255.0 };
+        Some(v as f32 / max)
+    };
+    let r = comp(it.next())?;
+    let g = comp(it.next())?;
+    let b = comp(it.next())?;
+    Some(0.299 * r + 0.587 * g + 0.114 * b)
 }
 
 fn no_color() -> bool {
