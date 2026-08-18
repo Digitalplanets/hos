@@ -58,6 +58,10 @@ pub struct Session {
     m: Gemma4,
     tok: GemmaTokenizer,
     gpu: Option<Gpu>,
+    // GPU-resident decoder (macOS): whole forward in one command buffer, no per-op
+    // CPU<->GPU round trips. Built when the GPU is on; decode uses it.
+    #[cfg(target_os = "macos")]
+    resident: Option<crate::gemma4::Gemma4Gpu>,
 }
 
 impl Session {
@@ -82,7 +86,17 @@ impl Session {
         } else {
             None
         };
-        Ok(Session { m, tok, gpu })
+        #[cfg(target_os = "macos")]
+        let resident = gpu
+            .as_ref()
+            .map(|g| crate::gemma4::Gemma4Gpu::new(g, &m));
+        Ok(Session {
+            m,
+            tok,
+            gpu,
+            #[cfg(target_os = "macos")]
+            resident,
+        })
     }
 
     /// Generate the model's reply to `history` (a list of (role, content) turns),
@@ -119,6 +133,46 @@ impl Session {
             }
             g => m.prefill(&mut cache, &ids, g),
         };
+
+        // GPU-resident decode: seed the KV from the CPU prefill, then decode on-GPU
+        // (one command buffer per token instead of ~336 CPU<->GPU round trips).
+        #[allow(unused_mut, unused_assignments)]
+        let mut use_resident = false;
+        #[allow(unused_mut, unused_assignments)]
+        let mut pos = cache.len();
+        #[cfg(target_os = "macos")]
+        {
+            let check = std::env::var("HOS_GEMMA4_RESIDENT_CHECK").is_ok();
+            use_resident = self.resident.is_some()
+                && gref.is_some()
+                && std::env::var("HOS_GEMMA4_NORESIDENT").is_err()
+                && !check
+                // keep the whole conversation inside the resident KV window; otherwise
+                // fall back to the (unbounded) CPU decode so nothing overflows.
+                && cache.len() + gp.n_predict.max(1) <= crate::gemma4::GEMMA_MAX_SEQ;
+            if let Some(r) = &self.resident {
+                if (use_resident || check) && gref.is_some() {
+                    r.upload_state(m, &cache);
+                }
+                if check {
+                    let am = |l: &[f32]| {
+                        l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                            if v > bv { (i, v) } else { (bi, bv) }
+                        }).0
+                    };
+                    let n0 = am(&logits) as u32;
+                    let l_cpu = m.decode_step(&mut cache.clone_cache(), n0, gref);
+                    let l_gpu = r.forward(m, n0, cache.len());
+                    let md = l_cpu.iter().zip(&l_gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    let mx = |l: &[f32]| l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    eprintln!(
+                        "[gemma4-resident-check] n0={n0} len cpu={} gpu={} | argmax cpu={} gpu={} {} | max val cpu={:.3} gpu={:.3} | max|dlogit|={:.4}",
+                        l_cpu.len(), l_gpu.len(), am(&l_cpu), am(&l_gpu),
+                        if am(&l_cpu) == am(&l_gpu) { "OK" } else { "MISMATCH" }, mx(&l_cpu), mx(&l_gpu), md,
+                    );
+                }
+            }
+        }
 
         let mut out_ids: Vec<u32> = Vec::new();
         let mut prev = String::new();
@@ -171,7 +225,20 @@ impl Session {
                 }
             }
             prev = now;
-            logits = m.decode_step(&mut cache, next, gref);
+            #[cfg(target_os = "macos")]
+            {
+                if use_resident {
+                    logits = self.resident.as_ref().unwrap().forward(m, next, pos);
+                    pos += 1;
+                } else {
+                    logits = m.decode_step(&mut cache, next, gref);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                logits = m.decode_step(&mut cache, next, gref);
+                let _ = (&mut pos, use_resident);
+            }
         }
         // Flush a short answer that never contained a newline (so it wasn't a header).
         if !head_done && !head_buf.is_empty() {

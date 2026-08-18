@@ -1540,6 +1540,70 @@ kernel void rope_partial(
     float x0 = v[a], x1 = v[bb];
     v[a] = x0 * c - x1 * s; v[bb] = x0 * s + x1 * c;
 }
+
+// ---- Gemma-4 specific kernels (resident decoder) ------------------------------
+// NEOX rope from a precomputed inv_freq table (Gemma uses per-layer tables, and the
+// global layers are partial — freqs past a cutoff are 0). gid over n_heads*half.
+kernel void rope_table(
+    device float* v [[buffer(0)]], device const float* inv_freq [[buffer(1)]],
+    constant uint& hh [[buffer(2)]], constant uint& pos [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint head = gid / hh; uint j = gid % hh; uint base = head * (hh * 2);
+    float ang = float(pos) * inv_freq[j]; float c = cos(ang), s = sin(ang);
+    float a = v[base + j], b = v[base + j + hh];
+    v[base + j] = a * c - b * s;
+    v[base + j + hh] = b * c + a * s;
+}
+
+// Attention over cached keys [lo, pos] with an explicit scale (Gemma uses 1.0).
+// One threadgroup per query head, `hd` threads (hd multiple of 32, <= 512). Online
+// (flash) softmax. `hd` up to 512 => up to 16 simdgroups, so the combine array is 16.
+kernel void gemma_attn(
+    device const float* q [[buffer(0)]], device const float* kcache [[buffer(1)]],
+    device const float* vcache [[buffer(2)]], device float* att [[buffer(3)]],
+    constant uint& hd [[buffer(4)]], constant uint& kv_dim [[buffer(5)]],
+    constant uint& kv_mul [[buffer(6)]], constant uint& pos [[buffer(7)]],
+    constant uint& lo [[buffer(8)]], constant float& scale [[buffer(9)]],
+    uint h [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float sg[16];
+    uint kvh = h / kv_mul;
+    uint lane = tid & 31u, sgid = tid >> 5, nsg = hd >> 5;
+    float qreg = q[h * hd + tid], acc = 0.0f, m = -3.0e38f, l = 0.0f;
+    for (uint t = lo; t <= pos; ++t) {
+        uint koff = t * kv_dim + kvh * hd;
+        float ps = simd_sum(qreg * kcache[koff + tid]);
+        if (lane == 0) sg[sgid] = ps;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float dot = 0.0f;
+        for (uint g = 0; g < nsg; ++g) dot += sg[g];
+        dot *= scale;
+        float m_new = max(m, dot); float corr = exp(m - m_new); float p = exp(dot - m_new);
+        l = l * corr + p;
+        acc = acc * corr + p * vcache[koff + tid];
+        m = m_new;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    att[h * hd + tid] = acc / l;
+}
+
+// gate = gelu_tanh(gate) * up
+kernel void gelu_mul(
+    device float* gate [[buffer(0)]], device const float* up [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) {
+    float x = gate[gid];
+    float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    gate[gid] = (0.5f * x * (1.0f + precise::tanh(inner))) * up[gid];
+}
+
+// x *= s  (Gemma's per-layer residual scalar)
+kernel void scalar_mul(
+    device float* x [[buffer(0)]], constant float& s [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) { x[gid] *= s; }
+
+// x = cap * tanh(x / cap)  (Gemma final logit softcap)
+kernel void softcap(
+    device float* x [[buffer(0)]], constant float& cap [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) { x[gid] = cap * tanh(x[gid] / cap); }
 "#;
 
 pub struct Gpu {

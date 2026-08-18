@@ -2263,6 +2263,393 @@ impl Gemma4Cache {
     }
 }
 
+// ============================================================================
+// Gemma4Gpu — a fully GPU-resident single-token decoder. Runs the whole forward
+// (matmuls + norms + rope + attention + gelu + softcap) in ONE command buffer with
+// activations and the KV cache resident on the GPU, so decode is not throttled by
+// ~336 per-op CPU<->GPU round trips per token (the reason plain `decode_step` is
+// slow). Mirrors qwen35's resident runner; reuses the already-uploaded Weight::Gpu
+// matrices. macOS/Metal only, opt-in until proven byte-exact.
+// ============================================================================
+#[cfg(target_os = "macos")]
+pub use resident::Gemma4Gpu;
+
+#[cfg(target_os = "macos")]
+pub const GEMMA_MAX_SEQ: usize = 8192;
+
+#[cfg(target_os = "macos")]
+mod resident {
+    use super::{Gemma4, Gemma4Cache, GEMMA_MAX_SEQ, HEAD_DIM_GLOBAL, INTER};
+    use crate::metal_be::{Gpu, GpuMatrix};
+    use metal::{
+        Buffer, BufferRef, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
+        MTLResourceOptions, MTLSize, ResourceRef,
+    };
+    use std::ffi::c_void;
+
+    pub struct Gemma4Gpu {
+        p_mv_f16: ComputePipelineState,
+        p_mv_q4k: ComputePipelineState,
+        p_mv_q5k: ComputePipelineState,
+        p_mv_q6k: ComputePipelineState,
+        p_mv_q8: ComputePipelineState,
+        p_rms: ComputePipelineState,
+        p_rms_h: ComputePipelineState,
+        p_rope: ComputePipelineState,
+        p_attn: ComputePipelineState,
+        p_store: ComputePipelineState,
+        p_gelu: ComputePipelineState,
+        p_scalar: ComputePipelineState,
+        p_softcap: ComputePipelineState,
+        p_add: ComputePipelineState,
+        p_copy: ComputePipelineState,
+        // activations (sized for the largest layer)
+        x: Buffer,
+        a: Buffer,
+        pf: Buffer,
+        t1: Buffer,
+        t2: Buffer,
+        q: Buffer,
+        k: Buffer,
+        v: Buffer,
+        att: Buffer,
+        gbuf: Buffer,
+        ubuf: Buffer,
+        logits: Buffer,
+        // per-layer params
+        input_ln: Vec<Buffer>,
+        post_attn_ln: Vec<Buffer>,
+        pre_ff_ln: Vec<Buffer>,
+        post_ff_ln: Vec<Buffer>,
+        q_norm: Vec<Buffer>,
+        k_norm: Vec<Buffer>,
+        inv_freq: Vec<Buffer>,
+        kcache: Vec<Buffer>,
+        vcache: Vec<Buffer>,
+        final_norm: Buffer,
+        ones: Buffer, // all-1 weights so rmsnorm_heads acts as scale-free v-norm
+        device: Device,
+        queue: CommandQueue,
+    }
+
+    impl Gemma4Gpu {
+        pub fn new(gpu: &Gpu, m: &Gemma4) -> Gemma4Gpu {
+            let device = gpu.device().clone();
+            let queue = gpu.queue().clone();
+            let lib = gpu.fused_library();
+            let pl = |n: &str| {
+                device
+                    .new_compute_pipeline_state_with_function(&lib.get_function(n, None).unwrap())
+                    .unwrap()
+            };
+            let c = &m.cfg;
+            let nb = |n: usize| {
+                device.new_buffer((n * 4).max(4) as u64, MTLResourceOptions::StorageModeShared)
+            };
+            let up = |d: &[f32]| {
+                device.new_buffer_with_data(
+                    d.as_ptr() as *const c_void,
+                    (d.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let max_q = c.n_heads * HEAD_DIM_GLOBAL; // 16*512
+            let mut input_ln = Vec::new();
+            let mut post_attn_ln = Vec::new();
+            let mut pre_ff_ln = Vec::new();
+            let mut post_ff_ln = Vec::new();
+            let mut q_norm = Vec::new();
+            let mut k_norm = Vec::new();
+            let mut inv_freq = Vec::new();
+            let mut kcache = Vec::new();
+            let mut vcache = Vec::new();
+            for lw in &m.layers {
+                input_ln.push(up(&lw.input_ln));
+                post_attn_ln.push(up(&lw.post_attn_ln));
+                pre_ff_ln.push(up(&lw.pre_ff_ln));
+                post_ff_ln.push(up(&lw.post_ff_ln));
+                q_norm.push(up(&lw.q_norm));
+                k_norm.push(up(&lw.k_norm));
+                inv_freq.push(up(if lw.global {
+                    &m.inv_freq_global
+                } else {
+                    &m.inv_freq_local
+                }));
+                let kv_dim = lw.n_kv() * lw.head_dim();
+                kcache.push(nb(GEMMA_MAX_SEQ * kv_dim));
+                vcache.push(nb(GEMMA_MAX_SEQ * kv_dim));
+            }
+            eprintln!("[gemma4] GPU-resident decoder ready");
+            Gemma4Gpu {
+                p_mv_f16: pl("matvec_f16"),
+                p_mv_q4k: pl("matvec_q4k_co"),
+                p_mv_q5k: pl("matvec_q5k_co"),
+                p_mv_q6k: pl("matvec_q6k_co"),
+                p_mv_q8: pl("matvec_q8_0_co"),
+                p_rms: pl("rmsnorm"),
+                p_rms_h: pl("rmsnorm_heads"),
+                p_rope: pl("rope_table"),
+                p_attn: pl("gemma_attn"),
+                p_store: pl("store_kv"),
+                p_gelu: pl("gelu_mul"),
+                p_scalar: pl("scalar_mul"),
+                p_softcap: pl("softcap"),
+                p_add: pl("add_inplace"),
+                p_copy: pl("copy_buf"),
+                x: nb(c.hidden),
+                a: nb(c.hidden),
+                pf: nb(c.hidden),
+                t1: nb(c.hidden),
+                t2: nb(c.hidden),
+                q: nb(max_q),
+                k: nb(2048),
+                v: nb(2048),
+                att: nb(max_q),
+                gbuf: nb(INTER),
+                ubuf: nb(INTER),
+                logits: nb(c.vocab),
+                input_ln,
+                post_attn_ln,
+                pre_ff_ln,
+                post_ff_ln,
+                q_norm,
+                k_norm,
+                inv_freq,
+                kcache,
+                vcache,
+                final_norm: up(&m.final_norm),
+                ones: up(&vec![1.0f32; HEAD_DIM_GLOBAL]),
+                device,
+                queue,
+            }
+        }
+
+        // Order dependent dispatches: one command buffer runs kernels concurrently
+        // unless a barrier forces the next to see the previous writes.
+        fn bar(enc: &ComputeCommandEncoderRef, outs: &[&BufferRef]) {
+            let r: Vec<&ResourceRef> = outs.iter().map(|&b| b as &ResourceRef).collect();
+            enc.memory_barrier_with_resources(&r);
+        }
+        fn set_u(enc: &ComputeCommandEncoderRef, i: u64, v: u32) {
+            enc.set_bytes(i, 4, &v as *const u32 as *const c_void);
+        }
+        fn set_f(enc: &ComputeCommandEncoderRef, i: u64, v: f32) {
+            enc.set_bytes(i, 4, &v as *const f32 as *const c_void);
+        }
+        // y = W x, coalesced K-quant / scalar f16, matching the CPU matvec.
+        fn mv(&self, enc: &ComputeCommandEncoderRef, w: &GpuMatrix, x: &BufferRef, y: &BufferRef) {
+            use crate::gguf::{GGML_F16, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0};
+            let (p, co) = match w.ggml_type {
+                GGML_Q4_K => (&self.p_mv_q4k, true),
+                GGML_Q5_K => (&self.p_mv_q5k, true),
+                GGML_Q6_K => (&self.p_mv_q6k, true),
+                GGML_Q8_0 => (&self.p_mv_q8, true),
+                GGML_F16 => (&self.p_mv_f16, false),
+                t => {
+                    eprintln!("[gemma4] no resident matvec for type {t}");
+                    std::process::exit(2);
+                }
+            };
+            enc.set_compute_pipeline_state(p);
+            enc.set_buffer(0, Some(w.buffer()), 0);
+            enc.set_buffer(1, Some(x), 0);
+            enc.set_buffer(2, Some(y), 0);
+            Self::set_u(enc, 3, w.in_dim as u32);
+            if co {
+                const NDST: u64 = 2;
+                Self::set_u(enc, 4, w.n_rows as u32);
+                let sg = (w.n_rows as u64).div_ceil(NDST);
+                enc.dispatch_threads(MTLSize::new(sg * 32, 1, 1), MTLSize::new(32, 1, 1));
+            } else {
+                enc.dispatch_threads(
+                    MTLSize::new(w.n_rows as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            }
+            Self::bar(enc, &[y]);
+        }
+        fn rms(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &BufferRef,
+            w: &BufferRef,
+            out: &BufferRef,
+            n: usize,
+            eps: f32,
+        ) {
+            enc.set_compute_pipeline_state(&self.p_rms);
+            enc.set_buffer(0, Some(x), 0);
+            enc.set_buffer(1, Some(w), 0);
+            enc.set_buffer(2, Some(out), 0);
+            Self::set_u(enc, 3, n as u32);
+            Self::set_f(enc, 4, eps);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+            Self::bar(enc, &[out]);
+        }
+        fn rms_heads(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &BufferRef,
+            w: &BufferRef,
+            heads: usize,
+            hd: usize,
+            eps: f32,
+        ) {
+            enc.set_compute_pipeline_state(&self.p_rms_h);
+            enc.set_buffer(0, Some(x), 0);
+            enc.set_buffer(1, Some(w), 0);
+            Self::set_u(enc, 2, hd as u32);
+            Self::set_f(enc, 3, eps);
+            enc.dispatch_thread_groups(MTLSize::new(heads as u64, 1, 1), MTLSize::new(256, 1, 1));
+            Self::bar(enc, &[x]);
+        }
+        fn elt(&self, enc: &ComputeCommandEncoderRef, p: &ComputePipelineState, a: &BufferRef, b: Option<&BufferRef>, n: usize) {
+            enc.set_compute_pipeline_state(p);
+            enc.set_buffer(0, Some(a), 0);
+            if let Some(bb) = b {
+                enc.set_buffer(1, Some(bb), 0);
+            }
+            enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+            Self::bar(enc, &[a]);
+        }
+
+        /// One decode step: token at absolute `pos`, returns post-softcap logits.
+        pub fn forward(&self, m: &Gemma4, id: u32, pos: usize) -> Vec<f32> {
+            let c = &m.cfg;
+            let hidden = c.hidden;
+            let nh = c.n_heads;
+            let eps = c.rms_eps;
+            // embed row * embed_scale -> x
+            let row = m.embed_row(id);
+            let scaled: Vec<f32> = row.iter().map(|&x| x * m.embed_scale).collect();
+            unsafe {
+                std::ptr::copy_nonoverlapping(scaled.as_ptr(), self.x.contents() as *mut f32, hidden);
+            }
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            for (l, lw) in m.layers.iter().enumerate() {
+                let hd = lw.head_dim();
+                let n_kv = lw.n_kv();
+                let kv_dim = n_kv * hd;
+                let q_dim = nh * hd;
+                let kv_mul = (nh / n_kv) as u32;
+                let half = hd / 2;
+                // input norm -> a ; projections
+                self.rms(enc, &self.x, &self.input_ln[l], &self.a, hidden, eps);
+                self.mv(enc, lw.wq.as_gpu(), &self.a, &self.q);
+                self.mv(enc, lw.wk.as_gpu(), &self.a, &self.k);
+                if lw.global {
+                    // k_eq_v: v = k source (before k-norm/rope). copy_buf is dst<-src,
+                    // and elt maps (arg0=buffer0=src, arg1=buffer1=dst): src=k, dst=v.
+                    self.elt(enc, &self.p_copy, &self.k, Some(&self.v), kv_dim);
+                } else {
+                    self.mv(enc, lw.wv.as_ref().unwrap().as_gpu(), &self.a, &self.v);
+                }
+                // per-head q/k norm (before rope), v-norm (scale-free)
+                self.rms_heads(enc, &self.q, &self.q_norm[l], nh, hd, eps);
+                self.rms_heads(enc, &self.k, &self.k_norm[l], n_kv, hd, eps);
+                self.rms_heads(enc, &self.v, &self.ones, n_kv, hd, eps);
+                // rope q,k
+                for (buf, heads) in [(&self.q, nh), (&self.k, n_kv)] {
+                    enc.set_compute_pipeline_state(&self.p_rope);
+                    enc.set_buffer(0, Some(buf), 0);
+                    enc.set_buffer(1, Some(&self.inv_freq[l]), 0);
+                    Self::set_u(enc, 2, half as u32);
+                    Self::set_u(enc, 3, pos as u32);
+                    enc.dispatch_threads(
+                        MTLSize::new((heads * half) as u64, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+                    Self::bar(enc, &[buf]);
+                }
+                // store k,v then attend
+                enc.set_compute_pipeline_state(&self.p_store);
+                enc.set_buffer(0, Some(&self.k), 0);
+                enc.set_buffer(1, Some(&self.v), 0);
+                enc.set_buffer(2, Some(&self.kcache[l]), 0);
+                enc.set_buffer(3, Some(&self.vcache[l]), 0);
+                Self::set_u(enc, 4, kv_dim as u32);
+                Self::set_u(enc, 5, pos as u32);
+                enc.dispatch_threads(MTLSize::new(kv_dim as u64, 1, 1), MTLSize::new(256, 1, 1));
+                Self::bar(enc, &[&self.kcache[l], &self.vcache[l]]);
+                let lo = if lw.global {
+                    0u32
+                } else {
+                    (pos as u32 + 1).saturating_sub(c.sliding_window as u32)
+                };
+                enc.set_compute_pipeline_state(&self.p_attn);
+                enc.set_buffer(0, Some(&self.q), 0);
+                enc.set_buffer(1, Some(&self.kcache[l]), 0);
+                enc.set_buffer(2, Some(&self.vcache[l]), 0);
+                enc.set_buffer(3, Some(&self.att), 0);
+                Self::set_u(enc, 4, hd as u32);
+                Self::set_u(enc, 5, kv_dim as u32);
+                Self::set_u(enc, 6, kv_mul);
+                Self::set_u(enc, 7, pos as u32);
+                Self::set_u(enc, 8, lo);
+                Self::set_f(enc, 9, 1.0); // Gemma attention scale = 1.0
+                enc.dispatch_thread_groups(MTLSize::new(nh as u64, 1, 1), MTLSize::new(hd as u64, 1, 1));
+                Self::bar(enc, &[&self.att]);
+                let _ = q_dim;
+                // o_proj -> t1 ; post_attn_ln -> t2 ; x += t2
+                self.mv(enc, lw.wo.as_gpu(), &self.att, &self.t1);
+                self.rms(enc, &self.t1, &self.post_attn_ln[l], &self.t2, hidden, eps);
+                self.elt(enc, &self.p_add, &self.x, Some(&self.t2), hidden);
+                // MLP
+                self.rms(enc, &self.x, &self.pre_ff_ln[l], &self.pf, hidden, eps);
+                self.mv(enc, lw.gate.as_gpu(), &self.pf, &self.gbuf);
+                self.mv(enc, lw.up.as_gpu(), &self.pf, &self.ubuf);
+                self.elt(enc, &self.p_gelu, &self.gbuf, Some(&self.ubuf), c.inter);
+                self.mv(enc, lw.down.as_gpu(), &self.gbuf, &self.t1);
+                self.rms(enc, &self.t1, &self.post_ff_ln[l], &self.t2, hidden, eps);
+                self.elt(enc, &self.p_add, &self.x, Some(&self.t2), hidden);
+                // per-layer residual scalar
+                enc.set_compute_pipeline_state(&self.p_scalar);
+                enc.set_buffer(0, Some(&self.x), 0);
+                Self::set_f(enc, 1, lw.layer_scalar);
+                enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
+                Self::bar(enc, &[&self.x]);
+            }
+            // final norm + tied lm-head + softcap
+            self.rms(enc, &self.x, &self.final_norm, &self.t2, hidden, eps);
+            self.mv(enc, m.embed.as_gpu(), &self.t2, &self.logits);
+            enc.set_compute_pipeline_state(&self.p_softcap);
+            enc.set_buffer(0, Some(&self.logits), 0);
+            Self::set_f(enc, 1, c.final_softcap);
+            enc.dispatch_threads(MTLSize::new(c.vocab as u64, 1, 1), MTLSize::new(256, 1, 1));
+            Self::bar(enc, &[&self.logits]);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            unsafe { std::slice::from_raw_parts(self.logits.contents() as *const f32, c.vocab) }.to_vec()
+        }
+
+        /// Seed the GPU KV cache from a CPU-prefilled `Gemma4Cache` (so a fast batched
+        /// CPU prefill can hand off to resident decode). Layouts match store_kv.
+        pub fn upload_state(&self, m: &Gemma4, cache: &Gemma4Cache) {
+            for (l, lw) in m.layers.iter().enumerate() {
+                let kv_dim = lw.n_kv() * lw.head_dim();
+                let n = cache.len * kv_dim;
+                if n == 0 {
+                    continue;
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        cache.k[l].as_ptr(),
+                        self.kcache[l].contents() as *mut f32,
+                        n.min(cache.k[l].len()),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        cache.v[l].as_ptr(),
+                        self.vcache[l].contents() as *mut f32,
+                        n.min(cache.v[l].len()),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// argmax + top-k helper (id, logit), descending.
 // ---- portable `.hos` capsule (ingest / load) ----------------------------
 // Gemma-4 is its own arch, so it serializes ITS tensors (already-quantized big
