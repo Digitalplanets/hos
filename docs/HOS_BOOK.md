@@ -158,7 +158,12 @@ a clean error instead of panicking.
 
 Families that run today: Llama / Mistral / Qwen2 / Qwen2.5 / SmolLM2 (CPU and
 fused Metal GPU, bit-identical between the two), plus Gemma-2, Phi-3, and the
-OLMoE mixture-of-experts on CPU. Gemma-4 multimodal image input is supported.
+OLMoE mixture-of-experts on CPU. Two flagship families run as their own native,
+from-scratch backends: **Gemma-4** — the 12B multimodal decoder (text + image),
+with its own GPU-resident runner and a chat template — and **Qwen3.8-27B**, a
+Gated-DeltaNet SSM + full-attention *hybrid* with a native vision tower and
+lossless speculative decoding (see 2.7). Both also load and run directly from a
+`.hos` capsule, not just a checkpoint directory.
 
 ### 2.4 The `.hos` capsule: a model that remembers where it came from
 
@@ -215,6 +220,26 @@ resident at their compressed size. HOS is not trying to win a tok/s sprint
 against a decade of `llama.cpp` kernel tuning. It is trying to be the engine that
 is competitive *and* readable *and* yours.
 
+Prompt processing on CPU reads each weight row once and dots it against the whole
+prompt at once, so long prompts don't re-dequantize the model per token — the
+same amortization the batched GPU path gets, on x86 and ARM alike.
+
+### 2.7 Hybrids and lossless speculative decoding
+
+Not every model is a plain transformer, and the engine follows. The Qwen3.8-27B
+backend is a **hybrid**: most of its layers are Gated-DeltaNet linear-attention
+SSM blocks — the L2-normed delta rule, the decay gate, the gated RMSNorm, the
+depthwise causal conv, all written from scratch — interleaved with full-attention
+layers, with a native vision tower and chat/thinking modes on top.
+
+It also ships **MTP self-speculative decoding**. The model carries its own trailing
+draft head; HOS uses it to propose the next token, then verifies the proposal with
+the backbone in a single batched two-token GPU pass (the weights are read once for
+both, which is where the speedup comes from). The emitted token is always a fresh
+backbone sample, so the output is **lossless** — byte-identical to ordinary
+decoding — while running roughly 1.6x faster on an M4 Max. Speculation that changes
+speed but never changes the answer.
+
 ---
 
 ## 3. flwr, the app
@@ -232,6 +257,17 @@ stays open. Same friendly commands, a different deal.
 - **The store is provenance-native.** `flwr list`, `flwr show`, `flwr cp`,
   `flwr quantize`, `flwr rm`. Every entry records where it came from, a content
   hash, and a lineage edge to its parent. A pulled model is never anonymous.
+- **The terminal is a real REPL.** `flwr run` is more than a prompt: `/models` and
+  `/list` are arrow-key pickers that switch the resident model or reopen a past
+  conversation live, `/param` tunes temperature / length / seed on the fly, `/role`
+  sets a persistent system instruction, and `/help` lists everything. Colors
+  auto-detect a light or dark terminal (it asks the terminal for its background),
+  and each run seeds itself fresh — the seed is shown and saved, so a reply you
+  like is reproducible with `--seed`.
+- **`serve` is more than the API.** The built-in browser UI switches the resident
+  model live from a dropdown, streams tokens, and shows a small live activity
+  meter (`GET /monitor`); reasoning models expose their full trace as a
+  content-addressed receipt you can fetch and build on.
 
 **Run your own hub.** Because pull is just "resolve a name to a URL plus a hash,
 download, verify," you can host `.hos` capsules anywhere (a static bucket, your
@@ -314,13 +350,14 @@ path with `-m`. Set `HOS_MODEL` for a default.
 **`flwr` (app).**
 
 ```
-flwr pull <name | hf-repo | url>     # into the store, verified, with provenance
-flwr list | show <name>              # what you have, and its card
-flwr run <name> [--gpu] [-p "..."]   # chat / one-shot
-flwr serve <name> [--port 11434]     # OpenAI-compatible API + chat UI
-flwr cp <src> <dst>                  # duplicate (keeps lineage)
-flwr quantize <src> <dst> --type q8_0# derive a smaller model (keeps lineage)
-flwr rm <name>                       # delete from the store
+flwr pull <name | hf-repo | url>      # into the store, verified, with provenance
+flwr list | show <name>               # what you have, and its card
+flwr run <name> [--gpu] [-p "..."] [--seed S]   # chat / one-shot
+        # in-chat:  /models  /list  /param  /role  /help  /bye
+flwr serve <name> [--port 11434]      # OpenAI-compatible API + chat UI + /monitor
+flwr cp <src> <dst>                   # duplicate (keeps lineage)
+flwr quantize <src> <dst> --type q8_0 # derive a smaller model (keeps lineage)
+flwr rm <name>                        # delete from the store
 ```
 
 **Deeper docs in this repo:** [`ARCHITECTURE.md`](ARCHITECTURE.md) (internals),
