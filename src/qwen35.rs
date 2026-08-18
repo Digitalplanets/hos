@@ -1257,7 +1257,7 @@ impl Qwen35 {
                 st.pos = p + 1;
             }
         }
-        if verifies > 0 {
+        if verifies > 0 && std::env::var("HOS_MTP_STATS").is_ok() {
             eprintln!(
                 "[mtp] acceptance {:.0}% ({}/{} drafts)",
                 100.0 * accepts as f64 / verifies as f64,
@@ -1349,7 +1349,7 @@ impl Qwen35 {
                 st.pos = p + 1;
             }
         }
-        if verifies > 0 {
+        if verifies > 0 && std::env::var("HOS_MTP_STATS").is_ok() {
             eprintln!(
                 "[mtp] acceptance {:.0}% ({}/{} drafts)",
                 100.0 * accepts as f64 / verifies as f64,
