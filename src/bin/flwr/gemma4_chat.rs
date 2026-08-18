@@ -96,7 +96,7 @@ pub fn run(path: &Path, o: &Opts) {
     // Interactive REPL.
     banner(path, o.gpu);
     let name = friendly_name(path);
-    println!("{}", crate::cmd_hint(false));
+    println!("{}", crate::cmd_hint(false, smp.seed));
     let mut history: Vec<(String, String)> = Vec::new();
     let mut last_memory_sig = String::new();
     let stdin = std::io::stdin();

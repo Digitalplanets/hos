@@ -194,7 +194,10 @@ impl Default for Params {
             top_p: 0.95,
             rep_penalty: 1.1,
             repeat_last_n: 64,
-            seed: 42,
+            // A fresh seed per request when the client doesn't send one, so replies
+            // vary (OpenAI convention: omitting `seed` is non-deterministic). A
+            // client that passes `seed` overrides this and gets reproducible output.
+            seed: crate::random_seed(),
             think: hos::qwen35::Think::default(),
         }
     }

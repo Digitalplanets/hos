@@ -82,6 +82,25 @@ fn usage() -> ! {
     std::process::exit(1);
 }
 
+/// A fresh per-run seed (zero-dep): scramble the wall-clock nanos + pid with
+/// splitmix64 so even close-in-time launches diverge. Used when `--seed` is omitted
+/// so chat feels fresh each run; pass `--seed`/`/param seed` to make it reproducible.
+fn random_seed() -> u64 {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let mut x = t ^ (std::process::id() as u64).rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    let s = x ^ (x >> 31);
+    if s == 0 {
+        0x1234_5678_9ABC_DEF1
+    } else {
+        s
+    }
+}
+
 fn parse() -> Opts {
     let mut o = Opts {
         cmd: String::new(),
@@ -111,6 +130,7 @@ fn parse() -> Opts {
         image: None,
         mmproj: None,
     };
+    let mut seed_given = false;
     let mut it = std::env::args().skip(1);
     o.cmd = it.next().unwrap_or_default();
     if o.cmd.is_empty() || o.cmd == "-h" || o.cmd == "--help" {
@@ -129,7 +149,10 @@ fn parse() -> Opts {
             "--temp" => o.temp = it.next().and_then(|v| v.parse().ok()).unwrap_or(o.temp),
             "--top-k" => o.top_k = it.next().and_then(|v| v.parse().ok()).unwrap_or(o.top_k),
             "--top-p" => o.top_p = it.next().and_then(|v| v.parse().ok()).unwrap_or(o.top_p),
-            "--seed" => o.seed = it.next().and_then(|v| v.parse().ok()).unwrap_or(o.seed),
+            "--seed" => {
+                o.seed = it.next().and_then(|v| v.parse().ok()).unwrap_or(o.seed);
+                seed_given = true;
+            }
             "--host" => o.host = it.next().unwrap_or(o.host),
             "--port" => o.port = it.next().and_then(|v| v.parse().ok()).unwrap_or(o.port),
             "--revision" | "--rev" => o.revision = it.next().unwrap_or(o.revision),
@@ -155,6 +178,11 @@ fn parse() -> Opts {
                 usage();
             }
         }
+    }
+    // No explicit --seed: pick a fresh one per run so chat isn't deterministic.
+    // (It's shown at startup and saved with each chat, so a good reply is reproducible.)
+    if !seed_given {
+        o.seed = random_seed();
     }
     o
 }
@@ -277,7 +305,7 @@ fn cmd_run(o: &Opts) {
     }
 
     organism_banner(&eng, &name, backend);
-    println!("{}", cmd_hint(true));
+    println!("{}", cmd_hint(true, smp.seed));
     let mut history: Vec<hos::chat::Message> = Vec::new();
     let mut last_memory_sig = String::new();
     let mut chat_id = crate::chats::new_id();
@@ -671,7 +699,7 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
     }
 
     qwen35_banner(&sess, &name, backend);
-    println!("{}", cmd_hint(true));
+    println!("{}", cmd_hint(true, smp.seed));
     let mut history: Vec<hos::chat::Message> = Vec::new();
     let mut last_memory_sig = String::new();
     let mut chat_id = crate::chats::new_id();
@@ -1085,14 +1113,15 @@ fn resolve_model_opt(name: &str) -> Option<PathBuf> {
 /// Shared by every REPL (llama / gemma4 / qwen35) so the look is consistent.
 /// The compact command line shown once under the banner (kept short; `/help` lists
 /// everything). `full` is the llama/qwen35 set; the gemma REPL is more minimal.
-pub fn cmd_hint(full: bool) -> String {
+pub fn cmd_hint(full: bool, seed: u64) -> String {
     use hos::viz::*;
     let cmds = if full {
         "/models · /list · /role · /new · /param · /help · /bye"
     } else {
         "/models · /reset · /param · /help · /bye"
     };
-    format!("    {}{cmds}{}", faint(), RESET)
+    // seed is shown so a good reply can be reproduced (--seed / /param seed to fix it)
+    format!("    {}{cmds}     seed {seed}{}", faint(), RESET)
 }
 
 /// `/help` — list every command (including the ones not in the compact hint).
