@@ -1,0 +1,66 @@
+name: release
+
+# Rebuild the prebuilt binaries for every platform and REPLACE the assets on an
+# existing release (default v0.1.0) — the install.sh / install.ps1 URLs are fixed
+# (releases/latest/download/<asset>), so keeping the asset names identical means
+# every installer serves the new build with no site change.
+#
+# Run it from the Actions tab ("Run workflow"), or:  gh workflow run release.yml
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose assets to replace"
+        default: v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,       target: aarch64-apple-darwin,       asset: flwr-macos-arm64.tar.gz }
+          - { os: macos-13,       target: x86_64-apple-darwin,        asset: flwr-macos-x86_64.tar.gz }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl,  asset: flwr-linux-x86_64.tar.gz }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, asset: flwr-linux-arm64.tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,     asset: flwr-windows-x86_64.zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain + target
+        run: rustup update stable && rustup target add ${{ matrix.target }}
+
+      - name: musl linker (linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --bins --target ${{ matrix.target }}
+
+      - name: Smoke test (runs natively on this runner)
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/flwr"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+          "$bin" list
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: tar -C "target/${{ matrix.target }}/release" -czf "${{ matrix.asset }}" hos flwr
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/hos.exe","target/${{ matrix.target }}/release/flwr.exe" -DestinationPath "${{ matrix.asset }}" -Force
+
+      - name: Replace the release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "${{ inputs.tag }}" "${{ matrix.asset }}" --clobber --repo "${{ github.repository }}"
