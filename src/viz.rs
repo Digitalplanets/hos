@@ -7,47 +7,83 @@
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
 
-fn fg(r: u8, g: u8, b: u8) -> String {
+/// True when the terminal has a light background, so the palette flips to
+/// dark-on-light (readable black-ish text and saturated accents on white).
+/// Decided once from `FLWR_THEME` (light|dark) or the `COLORFGBG` hint most
+/// terminals export; defaults to the dark palette when unknown.
+fn light_mode() -> bool {
+    use std::sync::OnceLock;
+    static LIGHT: OnceLock<bool> = OnceLock::new();
+    *LIGHT.get_or_init(|| {
+        match std::env::var("FLWR_THEME").map(|v| v.to_lowercase()).as_deref() {
+            Ok("light") => return true,
+            Ok("dark") => return false,
+            _ => {}
+        }
+        if let Ok(v) = std::env::var("COLORFGBG") {
+            if let Some(bg) = v.rsplit(';').next() {
+                if let Ok(n) = bg.trim().parse::<i32>() {
+                    // 7 = light gray, 15 = bright white, 9..=15 = bright colors
+                    return n == 7 || (9..=15).contains(&n);
+                }
+            }
+        }
+        false
+    })
+}
+
+fn no_color() -> bool {
+    use std::sync::OnceLock;
+    static NC: OnceLock<bool> = OnceLock::new();
+    *NC.get_or_init(|| std::env::var_os("NO_COLOR").is_some())
+}
+
+/// Pick the dark-bg or light-bg color; empty when NO_COLOR is set.
+fn fg(dark: (u8, u8, u8), light: (u8, u8, u8)) -> String {
+    if no_color() {
+        return String::new();
+    }
+    let (r, g, b) = if light_mode() { light } else { dark };
     format!("\x1b[38;2;{r};{g};{b}m")
 }
 
-// ---- palette: muted botanical. value-contrast in the flower (light petal ->
-// dark plum ring -> warm cream center) keeps the parts distinct without shouting.
+// ---- palette: muted botanical. Each color carries a dark-bg pastel and a
+// deeper light-bg value so the same names read well on white or black.
 pub fn petal() -> String {
-    fg(206, 142, 168)
+    fg((206, 142, 168), (168, 58, 104))
 } // flwr brand rose (= the wordmark)
 pub fn deep() -> String {
-    fg(176, 110, 140)
+    fg((176, 110, 140), (146, 52, 92))
 } // darker rose (petal body, same family)
 pub fn pollen() -> String {
-    fg(214, 186, 134)
+    fg((214, 186, 134), (150, 104, 24))
 } // soft cream center
 pub fn stem() -> String {
-    fg(138, 162, 128)
+    fg((138, 162, 128), (74, 108, 60))
 } // sage
 pub fn root() -> String {
-    fg(96, 120, 102)
+    fg((96, 120, 102), (60, 88, 66))
 } // moss
 pub fn signal() -> String {
-    fg(126, 172, 182)
+    fg((126, 172, 182), (34, 108, 124))
 } // muted teal
 pub fn dream() -> String {
-    fg(158, 146, 188)
+    fg((158, 146, 188), (96, 76, 150))
 } // soft lavender
 pub fn mem() -> String {
-    fg(194, 150, 170)
+    fg((194, 150, 170), (150, 74, 108))
 } // dusty rose
 pub fn ctx() -> String {
-    fg(134, 172, 162)
+    fg((134, 172, 162), (48, 108, 94))
 } // muted sage-teal
 pub fn slate() -> String {
-    fg(104, 108, 126)
+    fg((104, 108, 126), (150, 152, 164))
 } // frame
 pub fn ink() -> String {
-    fg(206, 208, 218)
-}
+    fg((206, 208, 218), (28, 30, 38))
+} // body text: light gray on dark, near-black on light
 pub fn faint() -> String {
-    fg(108, 113, 130)
+    fg((108, 113, 130), (128, 130, 144))
 }
 
 /// Visible width of a string, ignoring ANSI escape sequences.

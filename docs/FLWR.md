@@ -22,10 +22,11 @@ the project gives you both: `hos` (the engine/CLI) and `flwr` (this app).
 4. [How models are found](#4-how-models-are-found)
 5. [The model store](#5-the-model-store)
 6. [The OpenAI-compatible API](#6-the-openai-compatible-api)
-7. [Configuration & environment](#7-configuration--environment)
-8. [Sampling parameters](#8-sampling-parameters)
-9. [Troubleshooting](#9-troubleshooting)
-10. [FAQ](#10-faq)
+7. [Conversation memory](#7-conversation-memory)
+8. [Configuration & environment](#8-configuration--environment)
+9. [Sampling parameters](#9-sampling-parameters)
+10. [Troubleshooting](#10-troubleshooting)
+11. [FAQ](#11-faq)
 
 ---
 
@@ -379,7 +380,80 @@ chat requests queue and run one at a time. For parallel decode, run multiple
 
 ---
 
-## 7. Configuration & environment
+## 7. Conversation memory
+
+Long conversations are compacted before generation so small consumer devices do
+not resend an unbounded transcript every turn. flwr keeps the full raw transcript
+on disk, then assembles a compact context bundle for the model:
+
+```
+conversation turns
+  -> stable summary receipts
+  -> latest query + active subject frame
+  -> aggregate facts/tasks/preferences
+  -> recent raw turns
+  -> model prompt
+```
+
+The first implementation is intentionally local and dependency-light. It uses an
+extractive receipt for each fixed message range, then aggregates structured
+`keypoints`, `open_tasks`, `preferences`, and `pinned` slots from those receipts.
+When a transcript grows beyond the context budget, older turns are replaced by
+one synthetic system memory message while the newest turns stay verbatim. The
+receipt IDs are stable (`r<start>-<end>`), so old context is not rewritten just
+because a new turn arrived.
+
+The compacted prompt also carries a small subject/intent frame: latest user
+query, detected intent, active subject, subject aliases, and relationship
+snippets. This lets shorthand such as "battles the French lost" resolve to the
+active project subject "French Indian Wars" when that is the current scope, while
+still allowing a new subject to override old context when the user clearly
+changes direction. Meta-memory questions such as "what were the first subjects?"
+do not inherit a stale active subject; they are answered from the ordered
+detected-subject list.
+
+Saved chats include a `memory` block alongside the full `messages` array:
+
+```jsonc
+{
+  "messages": [ ... ],
+  "memory": {
+    "schema": 1,
+    "covered_messages": 18,
+    "summary": "...",
+    "keypoints": [ ... ],
+    "open_tasks": [ ... ],
+    "preferences": [ ... ],
+    "subjects": [ ... ],
+    "relationships": [ ... ],
+    "pinned": [],
+    "receipts": [
+      {
+        "id": "r0-8",
+        "start_message": 0,
+        "end_message": 8,
+        "summary": "...",
+        "keypoints": [ ... ],
+        "open_tasks": [ ... ],
+        "preferences": [ ... ],
+        "subjects": [ ... ],
+        "relationships": [ ... ],
+        "embedding_ref": null
+      }
+    ],
+    "embedding_refs": []
+  }
+}
+```
+
+`embedding_refs` is reserved for the next stage: local RAG/zettel retrieval using
+`hos::Engine::mean_hidden` embeddings and a plain local memory index. The
+responsible retrieval rule is: answer from the current receipt stack only when it
+contains enough evidence; otherwise retrieve broader receipts/notes by relevance,
+stitch them into a larger context bundle, and say what is missing rather than
+guessing when coverage is still insufficient.
+
+## 8. Configuration & environment
 
 | Variable | Used by | Effect |
 |---|---|---|
@@ -387,10 +461,14 @@ chat requests queue and run one at a time. For parallel decode, run multiple
 | `HOS_STORE` | flwr | Store root (fallback). Default `~/.hos/store`. |
 | `HOS_MODELS_DIR` | resolution | Extra directory searched for bare model names. |
 | `HOS_MODEL` | resolution | Default model name when none is given. |
+| `FLWR_CONTEXT_TOKENS` | memory | Approximate prompt budget before compacting. Default `3072`. |
+| `FLWR_RECENT_TURNS` | memory | Recent messages kept verbatim after compaction. Default `8`. |
+| `FLWR_MEMORY_BATCH_MESSAGES` | memory | Messages per stable summary receipt. Default `8`. |
+| `FLWR_MEMORY_DEBUG` | memory | Set `1` to log every compaction decision instead of only receipt changes. |
 
 ---
 
-## 8. Sampling parameters
+## 9. Sampling parameters
 
 | Parameter | Default | Notes |
 |---|---|---|
@@ -405,7 +483,7 @@ For fully reproducible output, use `--temp 0`.
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 **`flwr pull` fails immediately / "curl not available".**
 flwr uses the system `curl` to download. Ensure `curl` is on your `PATH`.
@@ -439,7 +517,7 @@ The Metal backend covers the Llama / Mistral / Qwen2 families; other arches
 
 ---
 
-## 10. FAQ
+## 11. FAQ
 
 **Is flwr the same as the `hos` command?**
 No. `hos` is the engine and its low-level CLI (raw completion, perplexity, bench,

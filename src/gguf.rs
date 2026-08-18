@@ -27,6 +27,7 @@ pub const GGML_Q8_0: u32 = 8;
 pub const GGML_Q4_K: u32 = 12;
 pub const GGML_Q5_K: u32 = 13;
 pub const GGML_Q6_K: u32 = 14;
+pub const GGML_BF16: u32 = 30;
 
 const QK: usize = 32; // block size for the simple (non-K) quant formats
 const QK_K: usize = 256; // super-block size for K-quants
@@ -344,6 +345,12 @@ impl Gguf {
                     out[i] = f16::from_bits(bits).to_f32();
                 }
             }
+            GGML_BF16 => {
+                for i in 0..n {
+                    let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                    out[i] = half::bf16::from_bits(bits).to_f32();
+                }
+            }
             GGML_Q8_0 => {
                 // block: f16 scale (2 bytes) + 32 * i8
                 let block_bytes = 2 + QK;
@@ -542,6 +549,7 @@ pub fn bytes_for(ggml_type: u32, n: usize) -> Result<usize> {
     Ok(match ggml_type {
         GGML_F32 => n * 4,
         GGML_F16 => n * 2,
+        GGML_BF16 => n * 2,
         GGML_Q8_0 => n / 32 * 34,
         GGML_Q4_0 => n / 32 * 18,
         GGML_Q5_0 => n / 32 * 22,

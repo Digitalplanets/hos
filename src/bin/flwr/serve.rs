@@ -37,6 +37,7 @@ pub enum Backend {
         sess: crate::gemma4_chat::Session,
         rng: u64,
     },
+    Qwen35(Box<hos::qwen35::ChatSession>),
 }
 
 impl Backend {
@@ -44,15 +45,19 @@ impl Backend {
         match self {
             Backend::Engine(e) => e.chat_family().label(),
             Backend::Gemma4 { .. } => "gemma",
+            Backend::Qwen35(s) => s.family_label(),
         }
     }
 
-    /// Generate a reply to `msgs`, streaming text to `on`. Same shape as
-    /// `Engine::chat`; returns the emitted token count.
+    /// Generate a reply to `msgs`, streaming `Chunk`s to `on` (reasoning vs answer).
+    /// Non-reasoning backends emit everything as `Chunk::Answer`; only qwen35 splits
+    /// out `<think>` reasoning. `think` is ignored by non-reasoning backends.
     #[allow(clippy::too_many_arguments)]
     fn chat(
         &mut self,
         msgs: &[Message],
+        image: Option<&[u8]>,
+        think: hos::qwen35::Think,
         max_tokens: usize,
         temp: f32,
         top_k: usize,
@@ -60,8 +65,9 @@ impl Backend {
         rep_penalty: f32,
         repeat_last_n: usize,
         seed: u64,
-        on: impl FnMut(&str),
+        mut on: impl FnMut(hos::qwen35::Chunk),
     ) -> usize {
+        use hos::qwen35::Chunk;
         match self {
             Backend::Engine(e) => e.chat(
                 msgs,
@@ -72,7 +78,7 @@ impl Backend {
                 rep_penalty,
                 repeat_last_n,
                 seed,
-                on,
+                |piece| on(Chunk::Answer(piece)),
             ),
             Backend::Gemma4 { sess, rng } => {
                 if seed != 0 {
@@ -80,7 +86,14 @@ impl Backend {
                 }
                 let hist: Vec<(String, String)> = msgs
                     .iter()
-                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .map(|m| {
+                        let role = if m.role == "assistant" {
+                            "model"
+                        } else {
+                            "user"
+                        };
+                        (role.to_string(), m.content.clone())
+                    })
                     .collect();
                 let gp = crate::gemma4_chat::GenParams {
                     n_predict: max_tokens,
@@ -91,22 +104,67 @@ impl Backend {
                     repeat_last_n,
                     seed,
                 };
-                sess.generate(&hist, &gp, rng, on)
+                sess.generate(&hist, &gp, rng, |piece| on(Chunk::Answer(piece)))
+            }
+            Backend::Qwen35(s) => {
+                // Encode the image (if any + a vision tower is attached) and splice
+                // it into the turn; otherwise this is a plain text chat.
+                let emb = match (image, s.has_vision()) {
+                    (Some(bytes), true) => match s.encode_image_bytes(bytes) {
+                        Ok(e) => Some(e),
+                        Err(err) => {
+                            eprintln!("  · image encode failed: {err}");
+                            None
+                        }
+                    },
+                    _ => None,
+                };
+                s.chat_img(
+                    msgs,
+                    emb.as_deref(),
+                    think,
+                    max_tokens,
+                    temp,
+                    top_k,
+                    top_p,
+                    rep_penalty,
+                    repeat_last_n,
+                    seed,
+                    on,
+                )
             }
         }
     }
 
-    /// Load a backend for `path`, picking the gemma4 session for gemma4 checkpoints.
+    /// Load a backend for `path`, picking the gemma4 or qwen35 session for those
+    /// custom arches and the generic `Engine` for everything else.
     pub fn load(path: &Path, gpu: bool) -> Result<Backend, String> {
         if crate::gemma4_chat::is_gemma4(path) {
-            crate::gemma4_chat::Session::load(path, gpu)
+            return crate::gemma4_chat::Session::load(path, gpu)
                 .map(|sess| Backend::Gemma4 { sess, rng: 42 })
-                .map_err(|e| e.to_string())
-        } else {
-            Engine::load(path, gpu)
-                .map(Backend::Engine)
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
         }
+        // qwen35 hybrid: a GGUF whose arch is the Gated-DeltaNet hybrid.
+        if let Ok(g) = hos::gguf::Gguf::open(path) {
+            if hos::model::Arch::detect(&g) == hos::model::Arch::Qwen35Hybrid {
+                let tok = hos::tokenizer::Tokenizer::from_gguf(&g).map_err(|e| e.to_string())?;
+                let mut s = hos::qwen35::ChatSession::load(&g, tok, gpu).map_err(|e| e.to_string())?;
+                // Auto-attach the vision tower if a sibling mmproj-*.gguf exists, so
+                // the OpenAI image_url path works out of the box.
+                if let Some(mmp) = crate::find_sibling_mmproj(path) {
+                    if let Ok(mg) = hos::gguf::Gguf::open(std::path::Path::new(&mmp)) {
+                        match s.attach_vision(&mg) {
+                            Ok(()) => eprintln!("    vision  mmproj attached ({mmp})"),
+                            Err(e) => eprintln!("    vision  mmproj load failed: {e}"),
+                        }
+                    }
+                }
+                return Ok(Backend::Qwen35(Box::new(s)));
+            }
+        }
+        Engine::load(path, gpu)
+            .map(Backend::Engine)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -119,6 +177,7 @@ struct Params {
     rep_penalty: f32,
     repeat_last_n: usize,
     seed: u64,
+    think: hos::qwen35::Think,
 }
 
 impl Default for Params {
@@ -131,6 +190,7 @@ impl Default for Params {
             rep_penalty: 1.1,
             repeat_last_n: 64,
             seed: 42,
+            think: hos::qwen35::Think::default(),
         }
     }
 }
@@ -143,6 +203,7 @@ struct ChatJob {
     msgs: Vec<Message>,
     params: Params,
     want_stream: bool,
+    image: Option<Vec<u8>>,
 }
 
 /// Work for the single engine-owning thread. `Switch` swaps the resident model
@@ -351,13 +412,14 @@ fn dispatch(
             write_json(&mut stream, 200, &payload)
         }
         ("POST", "/v1/chat/completions") => match parse_chat(&body) {
-            Ok((msgs, params, want_stream)) => {
+            Ok((msgs, params, want_stream, image)) => {
                 // Hand the connection to the engine thread; it writes the reply.
                 let _ = tx.send(Job::Chat(ChatJob {
                     stream,
                     msgs,
                     params,
                     want_stream,
+                    image,
                 }));
                 Ok(())
             }
@@ -418,6 +480,20 @@ fn dispatch(
             )
         }
 
+        // Reasoning receipts — the agent-facing read path. Fetch a model's full
+        // reasoning trace by the content-addressed id returned from a chat call.
+        ("GET", p) if p.starts_with("/v1/reasoning/") => {
+            let rid = &p["/v1/reasoning/".len()..];
+            match crate::reasoning::get(rid) {
+                Some(r) => write_json(&mut stream, 200, &r.to_json()),
+                None => write_json(
+                    &mut stream,
+                    404,
+                    &json!({ "error": { "message": "no such reasoning receipt" } }),
+                ),
+            }
+        }
+
         _ => write_text(&mut stream, 404, "Not Found", "no such organ\n"),
     }
 }
@@ -451,7 +527,15 @@ fn save_chat(model_name: &str, body: &[u8], stream: &mut TcpStream) -> std::io::
         "temperature": d.temp, "top_p": d.top_p, "top_k": d.top_k,
         "seed": d.seed, "repeat_penalty": d.rep_penalty, "max_tokens": d.max_tokens
     });
-    match crate::chats::save(&id, &v["messages"], model, params) {
+    let messages = &v["messages"];
+    let memory = crate::memory::summarize(&crate::memory::messages_from_json(messages));
+    match crate::chats::save(
+        &id,
+        messages,
+        model,
+        params,
+        crate::memory::to_json(&memory),
+    ) {
         Ok(meta) => write_json(stream, 200, &meta),
         Err(e) => write_json(
             stream,
@@ -462,17 +546,81 @@ fn save_chat(model_name: &str, body: &[u8], stream: &mut TcpStream) -> std::io::
 }
 
 /// Parse a chat-completions body into messages + sampling params.
-fn parse_chat(body: &[u8]) -> Result<(Vec<Message>, Params, bool), String> {
+/// Minimal, dependency-free base64 decoder for `data:...;base64,` image URLs.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let (mut out, mut buf, mut bits) = (Vec::new(), 0u32, 0u32);
+    for &c in s.as_bytes() {
+        if matches!(c, b'=' | b'\n' | b'\r' | b' ') {
+            continue;
+        }
+        buf = (buf << 6) | val(c)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// OpenAI content can be a plain string or an array of `{type:text|image_url}`.
+/// The visible text is the concatenation of the text parts.
+fn content_text(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    let mut t = String::new();
+    if let Some(arr) = content.as_array() {
+        for item in arr {
+            if item["type"] == "text" {
+                if let Some(s) = item["text"].as_str() {
+                    t.push_str(s);
+                }
+            }
+        }
+    }
+    t
+}
+
+/// Extract the first image from an OpenAI content array: a `data:...;base64,`
+/// URL (decoded) or a local file path.
+fn extract_image(content: &Value) -> Option<Vec<u8>> {
+    for item in content.as_array()? {
+        if item["type"] == "image_url" {
+            let url = item["image_url"]["url"].as_str()?;
+            if let Some(idx) = url.find("base64,") {
+                return b64_decode(&url[idx + 7..]);
+            }
+            if let Ok(b) = std::fs::read(url) {
+                return Some(b);
+            }
+        }
+    }
+    None
+}
+
+fn parse_chat(body: &[u8]) -> Result<(Vec<Message>, Params, bool, Option<Vec<u8>>), String> {
     let req: Value = serde_json::from_slice(body).map_err(|e| format!("bad JSON: {e}"))?;
+    let mut image: Option<Vec<u8>> = None;
     let msgs: Vec<Message> = req["messages"]
         .as_array()
         .map(|arr| {
             arr.iter()
                 .map(|m| {
-                    Message::new(
-                        m["role"].as_str().unwrap_or("user"),
-                        m["content"].as_str().unwrap_or(""),
-                    )
+                    if image.is_none() {
+                        image = extract_image(&m["content"]);
+                    }
+                    Message::new(m["role"].as_str().unwrap_or("user"), &content_text(&m["content"]))
                 })
                 .collect()
         })
@@ -493,14 +641,74 @@ fn parse_chat(body: &[u8]) -> Result<(Vec<Message>, Params, bool), String> {
     if let Some(v) = req["seed"].as_u64() {
         p.seed = v;
     }
+    // Reasoning controls (qwen35): OpenAI-style `reasoning_effort`, plus
+    // `enable_thinking` (Qwen convention). Ignored by non-reasoning models.
+    if let Some(v) = req["enable_thinking"].as_bool() {
+        p.think.on = v;
+    }
+    if let Some(s) = req["reasoning_effort"].as_str() {
+        if let Some(e) = hos::qwen35::Effort::parse(s) {
+            p.think.effort = e;
+        }
+    }
     let want_stream = req["stream"].as_bool().unwrap_or(false);
-    Ok((msgs, p, want_stream))
+    Ok((msgs, p, want_stream, image))
+}
+
+/// Build + persist a content-addressed reasoning receipt for a served turn, and
+/// return its id. Returns `None` when there was no reasoning (non-reasoning model
+/// or thinking disabled), so callers omit the field gracefully.
+fn save_reasoning_receipt(
+    model_name: &str,
+    msgs: &[Message],
+    reasoning: &str,
+    answer: &str,
+    think: hos::qwen35::Think,
+    n: usize,
+) -> Option<String> {
+    if reasoning.trim().is_empty() {
+        return None;
+    }
+    let query = msgs
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let effort = match think.effort {
+        hos::qwen35::Effort::Low => "low",
+        hos::qwen35::Effort::Medium => "medium",
+        hos::qwen35::Effort::Xhigh => "xhigh",
+    };
+    let rr = crate::reasoning::ReasoningReceipt::new(
+        "serve",
+        msgs.len(),
+        query,
+        effort,
+        reasoning,
+        answer,
+        n,
+        json!({ "name": model_name }),
+    );
+    crate::reasoning::save(&rr).ok().flatten()
 }
 
 /// Generate a reply on the engine thread and write it to the job's connection.
 fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::Result<()> {
     let p = &job.params;
+    let bundle = crate::memory::assemble(&job.msgs);
+    let chat_msgs = if bundle.omitted_messages > 0 {
+        &bundle.messages
+    } else {
+        &job.msgs
+    };
     eprint!("  · POST /v1/chat/completions  {} msg", job.msgs.len());
+    if bundle.omitted_messages > 0 {
+        eprint!(
+            "  compacted={} prompt~{}tok",
+            bundle.omitted_messages, bundle.estimated_tokens
+        );
+    }
     let started = std::time::Instant::now();
     let id = "chatcmpl-flwr";
 
@@ -512,8 +720,12 @@ fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::R
                     Connection: close\r\n\r\n";
         job.stream.write_all(head.as_bytes())?;
         let mut sink = job.stream.try_clone()?;
+        let mut reasoning = String::new();
+        let mut answer = String::new();
         let n = eng.chat(
-            &job.msgs,
+            chat_msgs,
+            job.image.as_deref(),
+            p.think,
             p.max_tokens,
             p.temp,
             p.top_k,
@@ -521,18 +733,38 @@ fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::R
             p.rep_penalty,
             p.repeat_last_n,
             p.seed,
-            |piece| {
-                let chunk = json!({
+            |chunk| {
+                // Reasoning streams as `reasoning_content` (OpenAI reasoning-model
+                // convention) so the visible `content` stays the clean answer.
+                let delta = match chunk {
+                    hos::qwen35::Chunk::Reasoning(t) => {
+                        reasoning.push_str(t);
+                        json!({ "reasoning_content": t })
+                    }
+                    hos::qwen35::Chunk::Answer(t) => {
+                        answer.push_str(t);
+                        json!({ "content": t })
+                    }
+                };
+                let evt = json!({
                     "id": id, "object": "chat.completion.chunk", "model": model_name,
-                    "choices": [ { "index": 0, "delta": { "content": piece }, "finish_reason": Value::Null } ]
+                    "choices": [ { "index": 0, "delta": delta, "finish_reason": Value::Null } ]
                 });
-                let _ = write!(sink, "data: {chunk}\r\n\r\n");
+                let _ = write!(sink, "data: {evt}\r\n\r\n");
                 let _ = sink.flush();
             },
         );
+        // Persist the reasoning receipt and announce its id as a final delta.
+        // Regular (non-reasoning) models get None here, so the delta stays empty —
+        // byte-identical to the pre-receipts behavior.
+        let rr_id = save_reasoning_receipt(model_name, &job.msgs, &reasoning, &answer, p.think, n);
+        let done_delta = match &rr_id {
+            Some(rid) => json!({ "reasoning_id": rid }),
+            None => json!({}),
+        };
         let done = json!({
             "id": id, "object": "chat.completion.chunk", "model": model_name,
-            "choices": [ { "index": 0, "delta": {}, "finish_reason": "stop" } ]
+            "choices": [ { "index": 0, "delta": done_delta, "finish_reason": "stop" } ]
         });
         write!(sink, "data: {done}\r\n\r\n")?;
         sink.write_all(b"data: [DONE]\r\n\r\n")?;
@@ -544,8 +776,11 @@ fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::R
         Ok(())
     } else {
         let mut text = String::new();
+        let mut reasoning = String::new();
         let n = eng.chat(
-            &job.msgs,
+            chat_msgs,
+            job.image.as_deref(),
+            p.think,
             p.max_tokens,
             p.temp,
             p.top_k,
@@ -553,14 +788,27 @@ fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::R
             p.rep_penalty,
             p.repeat_last_n,
             p.seed,
-            |piece| text.push_str(piece),
+            |chunk| match chunk {
+                hos::qwen35::Chunk::Reasoning(t) => reasoning.push_str(t),
+                hos::qwen35::Chunk::Answer(t) => text.push_str(t),
+            },
         );
         eprintln!("  -> {n} tok  {:.2}s", started.elapsed().as_secs_f64());
+        let mut message = json!({ "role": "assistant", "content": text });
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = json!(reasoning.trim());
+        }
+        // Persist a content-addressed reasoning receipt; expose its id so a client
+        // or agent can fetch the full trace later via GET /v1/reasoning/{id}.
+        let rr_id = save_reasoning_receipt(model_name, &job.msgs, &reasoning, &text, p.think, n);
+        if let Some(rid) = &rr_id {
+            message["reasoning_id"] = json!(rid);
+        }
         let payload = json!({
             "id": id, "object": "chat.completion", "model": model_name,
             "choices": [ {
                 "index": 0,
-                "message": { "role": "assistant", "content": text },
+                "message": message,
                 "finish_reason": "stop"
             } ],
             "usage": { "completion_tokens": n }
@@ -617,64 +865,73 @@ const CHAT_HTML: &str = r##"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>flwr</title>
 <style>
-  /* BRUTALIST — palette in CSS vars; swap these 5 lines for your exact colors. */
-  :root{ --bg:#f2f0eb; --ink:#111111; --accent:#ff4a1c; --accent-fg:#ffffff; --line:#111111; --soft:#ffffff; }
+  /* flwr serve — the terminal-blockprint look of flwr.systems, in CSS vars so
+     the theme switcher can flip it live. */
+  :root{ --bg:#0d1218; --ink:#ced2dc; --accent:#d98faa; --accent-fg:#150c11; --line:rgba(140,152,172,.30); --soft:#0f151c; }
   *{box-sizing:border-box}
+  ::selection{background:var(--accent);color:var(--accent-fg)}
   body{margin:0;background:var(--bg);color:var(--ink);
-    font:15px/1.6 ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
-  .wrap{max-width:820px;margin:0 auto;padding:0 20px 170px}
-  header{border-bottom:3px solid var(--line);padding:30px 0 14px}
-  h1{font-size:46px;font-weight:800;letter-spacing:-1.5px;margin:0;text-transform:lowercase}
-  .sub{margin-top:8px;text-transform:uppercase;letter-spacing:.18em;font-size:11px}
-  .meta{margin-top:6px;font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.1em}
-  .turn{border-bottom:1px solid var(--line);padding:16px 0}
-  .role{display:inline-block;text-transform:uppercase;letter-spacing:.14em;font-size:10px;
-    font-weight:700;padding:2px 9px;border:2px solid var(--ink);margin-bottom:9px}
-  .turn.you .role{background:var(--ink);color:var(--bg)}
-  .turn.flwr .role{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
-  .text{white-space:pre-wrap;word-wrap:break-word}
-  .empty{padding:28px 0;text-transform:uppercase;letter-spacing:.12em;font-size:12px;color:#666}
-  .composer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:3px solid var(--line)}
-  .composer .inner{max-width:820px;margin:0 auto;padding:12px 20px;display:flex;gap:12px}
-  textarea{flex:1;resize:none;border:2px solid var(--ink);border-radius:0;background:var(--soft);
-    padding:11px 12px;font:inherit;min-height:46px;max-height:170px;box-shadow:5px 5px 0 var(--ink)}
-  textarea:focus{outline:none;border-color:var(--accent);box-shadow:5px 5px 0 var(--accent)}
-  button{border:2px solid var(--ink);border-radius:0;background:var(--accent);color:var(--accent-fg);
-    padding:0 24px;font:inherit;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
-    cursor:pointer;box-shadow:5px 5px 0 var(--ink)}
-  button:active{transform:translate(5px,5px);box-shadow:none}
-  button:disabled{opacity:.5;cursor:default;box-shadow:none}
-  footer{border-top:3px solid var(--line);text-align:center;padding:16px 0;font-size:10px;
-    text-transform:uppercase;letter-spacing:.22em}
-  .themebar{margin-top:13px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  .themebar .lbl{font-size:10px;letter-spacing:.16em;color:#666}
-  .themebar button{box-shadow:none;padding:3px 11px;font-size:10px;background:var(--soft);
-    color:var(--ink);border:2px solid var(--ink)}
-  .themebar button.on{background:var(--ink);color:var(--bg)}
+    font:14px/1.65 ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    -webkit-font-smoothing:antialiased}
   .app{display:flex;align-items:flex-start}
-  .side{flex:0 0 240px;width:240px;border-right:3px solid var(--line);height:100vh;
-    position:sticky;top:0;overflow:auto}
+  .side{flex:0 0 236px;width:236px;border-right:1px solid var(--line);height:100vh;
+    position:sticky;top:0;overflow:auto;background:var(--soft)}
   .sidehead{display:flex;justify-content:space-between;align-items:center;
-    border-bottom:3px solid var(--line);padding:18px 14px;text-transform:uppercase;
-    letter-spacing:.14em;font-size:11px;font-weight:700}
-  .sidehead button{box-shadow:none;padding:4px 10px;font-size:10px}
+    border-bottom:1px solid var(--line);padding:16px 14px;text-transform:uppercase;
+    letter-spacing:.16em;font-size:10px;font-weight:700;color:var(--accent)}
+  .sidehead button{padding:4px 10px;font-size:10px}
   #chatlist{display:flex;flex-direction:column}
-  .chatitem{display:block;width:100%;text-align:left;font:inherit;color:inherit;cursor:pointer;
-    background:none;border:0;border-bottom:1px solid var(--line);border-left:4px solid transparent;
-    border-radius:0;box-shadow:none;padding:11px 14px;text-transform:none;letter-spacing:0}
-  .chatitem:hover{background:var(--soft)}
-  .chatitem.on{border-left-color:var(--accent)}
-  .chatitem .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .chatitem .m{font-size:10px;color:#777;text-transform:uppercase;letter-spacing:.08em;margin-top:3px}
-  .chatitem .del{float:right;color:#999;font-weight:700;padding-left:10px}
-  .chatitem .del:hover{color:var(--accent)}
-  .composer{left:240px}
-  .modelrow{margin-top:11px;display:flex;gap:8px;align-items:center}
-  .modelrow .lbl{font-size:10px;letter-spacing:.16em;color:#666}
-  select#modelsel{font:inherit;font-size:12px;border:2px solid var(--ink);border-radius:0;
-    background:var(--soft);color:var(--ink);padding:4px 8px;box-shadow:3px 3px 0 var(--ink);
-    max-width:520px}
+  .chatitem{display:block;width:100%;text-align:left;font:inherit;color:var(--ink);cursor:pointer;
+    background:none;border:0;border-bottom:1px solid var(--line);border-left:2px solid transparent;
+    padding:11px 14px}
+  .chatitem:hover{background:var(--bg)}
+  .chatitem.on{border-left-color:var(--accent);background:var(--bg)}
+  .chatitem .t{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chatitem .m{font-size:10px;color:var(--accent);opacity:.7;text-transform:uppercase;letter-spacing:.08em;margin-top:3px}
+  .chatitem .del{float:right;opacity:.5;font-weight:700;padding-left:10px}
+  .chatitem .del:hover{opacity:1;color:var(--accent)}
+  .wrap{flex:1;max-width:840px;margin:0 auto;padding:0 22px 180px}
+  header{border-bottom:1px solid var(--line);padding:26px 0 16px}
+  h1{font-size:34px;font-weight:700;letter-spacing:-1px;margin:0;text-transform:lowercase;color:var(--accent)}
+  .sub{margin-top:8px;opacity:.75;font-size:13px}
+  .meta{margin-top:8px;font-size:10px;opacity:.55;text-transform:uppercase;letter-spacing:.14em}
+  .turn{border-bottom:1px solid var(--line);padding:16px 0}
+  .role{display:inline-block;text-transform:uppercase;letter-spacing:.16em;font-size:9px;
+    font-weight:700;padding:2px 8px;border:1px solid var(--line);border-radius:3px;margin-bottom:9px;opacity:.9}
+  .turn.you .role{color:var(--ink);border-color:var(--line)}
+  .turn.flwr .role{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+  .text{white-space:pre-wrap;word-wrap:break-word;line-height:1.7}
+  .empty{padding:30px 0;text-transform:uppercase;letter-spacing:.14em;font-size:11px;opacity:.5}
+  .composer{position:fixed;left:236px;right:0;bottom:0;background:var(--bg);border-top:1px solid var(--line)}
+  .composer .inner{max-width:840px;margin:0 auto;padding:14px 22px;display:flex;gap:12px}
+  textarea{flex:1;resize:none;border:1px solid var(--line);border-radius:5px;background:var(--soft);
+    color:var(--ink);padding:11px 13px;font:inherit;min-height:46px;max-height:170px}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  textarea::placeholder{color:var(--ink);opacity:.4}
+  button{border:1px solid var(--accent);border-radius:5px;background:var(--accent);color:var(--accent-fg);
+    padding:0 22px;font:inherit;font-weight:700;text-transform:uppercase;letter-spacing:.1em;cursor:pointer}
+  button:hover{filter:brightness(1.07)}
+  button:active{transform:translateY(1px)}
+  button:disabled{opacity:.5;cursor:default}
+  footer{border-top:1px solid var(--line);text-align:center;padding:16px 0;font-size:10px;
+    opacity:.5;text-transform:uppercase;letter-spacing:.24em}
+  .themebar{margin-top:13px;display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+  .themebar .lbl,.modelrow .lbl{font-size:10px;letter-spacing:.16em;opacity:.5}
+  .themebar button{padding:3px 11px;font-size:9px;background:var(--soft);color:var(--ink);
+    border:1px solid var(--line);letter-spacing:.12em}
+  .themebar button.on{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+  .modelrow{margin-top:12px;display:flex;gap:8px;align-items:center}
+  select#modelsel{font:inherit;font-size:12px;border:1px solid var(--line);border-radius:5px;
+    background:var(--soft);color:var(--ink);padding:5px 9px;max-width:520px}
   select#modelsel:disabled{opacity:.5}
+  .sysrow{margin-top:12px}
+  .systoggle{padding:3px 11px;font-size:9px;background:var(--soft);color:var(--ink);
+    border:1px solid var(--line);letter-spacing:.12em;text-transform:uppercase;cursor:pointer}
+  .systoggle.on{border-color:var(--accent);color:var(--accent)}
+  .sysbox{display:none;width:100%;margin-top:9px;resize:vertical;border:1px solid var(--line);
+    border-radius:5px;background:var(--soft);color:var(--ink);padding:10px 12px;font:inherit;min-height:54px}
+  .sysbox:focus{outline:none;border-color:var(--accent)}
+  .sysbox.show{display:block}
 </style>
 </head>
 <body>
@@ -686,10 +943,12 @@ const CHAT_HTML: &str = r##"<!doctype html>
   <div class="wrap">
     <header>
       <h1>flwr</h1>
-      <div class="sub">one body — a local model on the HOS engine, talking.</div>
+      <div class="sub">one body, a local model on the HOS engine, talking.</div>
       <div class="meta" id="meta">connecting…</div>
       <div class="modelrow"><span class="lbl">MODEL</span><select id="modelsel"></select></div>
       <div class="themebar" id="themebar"><span class="lbl">THEME</span></div>
+      <div class="sysrow"><button class="systoggle" id="systoggle">&#9881; instruction</button></div>
+      <textarea id="sys" class="sysbox" placeholder="Optional: give the model a role or a core instruction. It persists for this conversation."></textarea>
     </header>
     <div id="log"><div class="empty" id="empty">Ask it something below.</div></div>
   </div>
@@ -706,10 +965,10 @@ const log=document.getElementById('log'), input=document.getElementById('in'),
 let chatId=newId();
 // In-app brutalist palettes. Each sets the CSS variables; pick one live.
 const PALETTES={
-  bone:{name:'BONE',v:{'--bg':'#f2f0eb','--ink':'#111111','--accent':'#ff4a1c','--accent-fg':'#ffffff','--line':'#111111','--soft':'#ffffff'}},
-  concrete:{name:'CONCRETE',v:{'--bg':'#e4e4e4','--ink':'#0a0a0a','--accent':'#0000ee','--accent-fg':'#ffffff','--line':'#0a0a0a','--soft':'#ffffff'}},
-  acid:{name:'ACID',v:{'--bg':'#fafaf0','--ink':'#111111','--accent':'#d6f500','--accent-fg':'#111111','--line':'#111111','--soft':'#ffffff'}},
-  ink:{name:'INK',v:{'--bg':'#0e0e0e','--ink':'#f5f5f5','--accent':'#ff4a1c','--accent-fg':'#ffffff','--line':'#f5f5f5','--soft':'#1a1a1a'}}
+  flwr:{name:'FLWR',v:{'--bg':'#0d1218','--ink':'#ced2dc','--accent':'#d98faa','--accent-fg':'#150c11','--line':'rgba(140,152,172,.30)','--soft':'#0f151c'}},
+  bloom:{name:'BLOOM',v:{'--bg':'#0d1218','--ink':'#ced2dc','--accent':'#d6ba86','--accent-fg':'#1a130a','--line':'rgba(140,152,172,.30)','--soft':'#0f151c'}},
+  moss:{name:'MOSS',v:{'--bg':'#0d1218','--ink':'#ced2dc','--accent':'#8fae86','--accent-fg':'#0d1512','--line':'rgba(140,152,172,.30)','--soft':'#0f151c'}},
+  paper:{name:'PAPER',v:{'--bg':'#f6f4ef','--ink':'#1a1d24','--accent':'#b06e8c','--accent-fg':'#ffffff','--line':'rgba(40,44,54,.20)','--soft':'#ffffff'}}
 };
 function applyTheme(key){
   const p=PALETTES[key]; if(!p) return;
@@ -723,7 +982,7 @@ function applyTheme(key){
     const b=document.createElement('button'); b.textContent=PALETTES[k].name; b.dataset.k=k;
     b.onclick=()=>applyTheme(k); bar.appendChild(b);
   }
-  let saved='bone'; try{saved=localStorage.getItem('flwr-theme')||'bone';}catch(e){}
+  let saved='flwr'; try{const s=localStorage.getItem('flwr-theme'); if(s&&PALETTES[s]) saved=s;}catch(e){}
   applyTheme(saved);
 })();
 const modelsel=document.getElementById('modelsel');
@@ -763,6 +1022,7 @@ function turn(cls,label){
 }
 async function ask(){
   const text=input.value.trim(); if(!text) return;
+  setSystem(sysBox.value);
   input.value=''; send.disabled=true;
   turn('you','You').textContent=text;
   messages.push({role:'user',content:text});
@@ -793,6 +1053,18 @@ send.onclick=ask;
 input.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault(); ask();} });
 input.focus();
 
+// ---- system instruction (a role that persists for this conversation) ----
+const sysBox=document.getElementById('sys'), sysToggle=document.getElementById('systoggle');
+function setSystem(text){
+  text=(text||'').trim();
+  const hasSys=messages[0]&&messages[0].role==='system';
+  if(text){ if(hasSys) messages[0].content=text; else messages.unshift({role:'system',content:text}); }
+  else if(hasSys){ messages.shift(); }
+}
+function syncSystemBox(){ const s=messages.find(m=>m.role==='system'); sysBox.value=s?s.content:''; if(s){ sysBox.classList.add('show'); sysToggle.classList.add('on'); } }
+sysToggle.onclick=()=>{ const on=sysBox.classList.toggle('show'); sysToggle.classList.toggle('on',on); if(on) sysBox.focus(); };
+sysBox.addEventListener('input',()=>setSystem(sysBox.value));
+
 // ---- saved chats (provenance-bearing transcripts on the server) ----
 function newId(){return 'c'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);}
 function fmtAgo(u){ if(!u) return ''; let s=Math.floor(Date.now()/1000)-u;
@@ -800,8 +1072,9 @@ function fmtAgo(u){ if(!u) return ''; let s=Math.floor(Date.now()/1000)-u;
   if(s<86400)return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; }
 function renderMessages(){
   log.innerHTML='';
-  if(!messages.length){ log.innerHTML='<div class="empty">Ask it something below.</div>'; return; }
-  for(const m of messages){ turn(m.role==='user'?'you':'flwr', m.role==='user'?'You':'flwr').textContent=m.content; }
+  const visible=messages.filter(m=>m.role!=='system');
+  if(!visible.length){ log.innerHTML='<div class="empty">Ask it something below.</div>'; return; }
+  for(const m of visible){ turn(m.role==='user'?'you':'flwr', m.role==='user'?'You':'flwr').textContent=m.content; }
 }
 async function refreshChats(){
   try{
@@ -821,16 +1094,16 @@ async function loadChat(id){
   try{
     const c=await (await fetch('/chats/'+encodeURIComponent(id))).json();
     messages.length=0; for(const m of (c.messages||[])) messages.push(m);
-    chatId=id; renderMessages(); refreshChats(); window.scrollTo(0,document.body.scrollHeight);
+    chatId=id; syncSystemBox(); renderMessages(); refreshChats(); window.scrollTo(0,document.body.scrollHeight);
   }catch(e){}
 }
 async function delChat(id){
   try{ await fetch('/chats/'+encodeURIComponent(id),{method:'DELETE'}); }catch(e){}
   if(id===chatId){ newChat(); } else { refreshChats(); }
 }
-function newChat(){ chatId=newId(); messages.length=0; renderMessages(); refreshChats(); input.focus(); }
+function newChat(){ chatId=newId(); messages.length=0; setSystem(sysBox.value); renderMessages(); refreshChats(); input.focus(); }
 async function saveCurrent(){
-  if(!messages.length) return;
+  if(!messages.some(m=>m.role!=='system')) return;
   try{ await fetch('/chats',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({id:chatId,messages})}); refreshChats(); }catch(e){}
 }

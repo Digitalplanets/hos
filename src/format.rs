@@ -273,7 +273,10 @@ pub fn read_card(path: &Path) -> io::Result<Card> {
     let mut hdr = [0u8; 16];
     f.read_exact(&mut hdr)?;
     if &hdr[0..4] != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a .hos capsule"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a .hos capsule",
+        ));
     }
     let card_len = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
     let mut cb = vec![0u8; card_len];

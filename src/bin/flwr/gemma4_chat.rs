@@ -81,6 +81,7 @@ pub fn run(path: &Path, o: &Opts) {
     // Interactive REPL.
     banner(path, o.gpu);
     let mut history: Vec<(String, String)> = Vec::new();
+    let mut last_memory_sig = String::new();
     let stdin = std::io::stdin();
     loop {
         print!(
@@ -108,7 +109,13 @@ pub fn run(path: &Path, o: &Opts) {
             _ => {}
         }
         history.push(("user".to_string(), text.to_string()));
-        let reply = say(&sess, &history, &mut rng);
+        let (compact, memory, omitted) = crate::memory::compact_gemma_history(&history);
+        let sig = crate::memory::receipt_signature(&memory);
+        if omitted > 0 && (crate::memory::debug_compaction() || sig != last_memory_sig) {
+            eprintln!("    · using memory receipts for {omitted} older messages");
+        }
+        last_memory_sig = sig;
+        let reply = say(&sess, &compact, &mut rng);
         history.push(("model".to_string(), reply.trim().to_string()));
     }
     println!("    · session closed.");

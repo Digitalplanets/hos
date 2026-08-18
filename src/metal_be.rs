@@ -324,6 +324,42 @@ kernel void matvec_q4k_co(
     for (uint r = 0; r < NDST; ++r) { float t = simd_sum(acc[r]); if (lane == 0 && row0 + r < n_rows) y[row0 + r] = t; }
 }
 
+// 2-token coalesced q4_k matmul (MTP verify): same coalesced NDST-rows-per-simd
+// structure as matvec_q4k_co (so it's ~as fast per weight read), but each decoded
+// weight is multiplied into BOTH tokens — weight read ONCE for 2 tokens.
+// X = [2, in_dim], Y = [2, n_rows].
+kernel void matmul_q4k_co2(
+    device const uchar* w [[buffer(0)]], device const float* X [[buffer(1)]],
+    device float* Y [[buffer(2)]], constant uint& in_dim [[buffer(3)]],
+    constant uint& n_rows [[buffer(4)]],
+    uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = (gid / 32) * NDST; uint nsb = in_dim / 256; uint sbb = nsb * 144;
+    float a0[NDST], a1[NDST];
+    for (uint r = 0; r < NDST; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; }
+    for (uint sbk = 0; sbk < nsb; ++sbk) {
+        float d[NDST], dmin[NDST]; device const uchar* scales[NDST]; device const uchar* qs[NDST];
+        for (uint r = 0; r < NDST; ++r) {
+            uint p = min(row0 + r, n_rows - 1) * sbb + sbk * 144;
+            d[r] = rdh(w, p); dmin[r] = rdh(w, p + 2); scales[r] = w + p + 4; qs[r] = w + p + 16;
+        }
+        uint xo = sbk * 256;
+        for (uint sb = 0; sb < 8; ++sb) {
+            uint qi = (sb / 2) * 32 + lane; uint xc = xo + sb * 32 + lane;
+            float xv0 = X[xc]; float xv1 = X[in_dim + xc];
+            for (uint r = 0; r < NDST; ++r) {
+                uchar sc, m; getsm(scales[r], sb, sc, m);
+                uint nib = (sb & 1) ? (qs[r][qi] >> 4) : (qs[r][qi] & 0xF);
+                float wv = d[r] * sc * (float)nib - dmin[r] * m;
+                a0[r] += wv * xv0; a1[r] += wv * xv1;
+            }
+        }
+    }
+    for (uint r = 0; r < NDST; ++r) {
+        float t0 = simd_sum(a0[r]); float t1 = simd_sum(a1[r]);
+        if (lane == 0 && row0 + r < n_rows) { Y[row0 + r] = t0; Y[n_rows + row0 + r] = t1; }
+    }
+}
+
 // ---- BATCHED q4_k matmul (prefill): Y[ntok, n_rows] = X[ntok, in_dim] @ W^T ----
 // One 32-lane simdgroup per output row. Each dequantized weight element is
 // computed ONCE and multiplied into all `ntok` token-vectors — so the row's
@@ -427,6 +463,74 @@ kernel void dequant_q4k_to_f32(
     out[gid] = d * sc * (float)nib - dmin * m;
 }
 
+// Per-element q6_k -> f32 (mirror of the matvec_q6k block decode). One thread per
+// output element; feeds the shared batched-prefill GEMM for q6_k weights.
+kernel void dequant_q6k_to_f32(
+    device const uchar* w [[buffer(0)]], device float* out [[buffer(1)]],
+    constant uint& in_dim [[buffer(2)]], constant uint& n_rows [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= n_rows * in_dim) return;
+    uint row = gid / in_dim, col = gid % in_dim;
+    uint nsb = in_dim / 256; uint sbb = nsb * 210;
+    uint sbk = col / 256, within = col % 256;
+    uint p = row * sbb + sbk * 210;
+    device const uchar* ql = w + p; device const uchar* qh = w + p + 128;
+    device const char* sc = (device const char*)(w + p + 192);
+    float d = rdh(w, p + 208);
+    uint n = within / 128, r = within % 128;
+    uint group = r / 32, l = r % 32, is = l / 16;
+    device const uchar* ql2 = ql + n * 64; device const uchar* qh2 = qh + n * 32;
+    device const char* sc2 = sc + n * 8;
+    int q;
+    if (group == 0)      q = (int)((ql2[l]      & 0xF) | (((qh2[l] >> 0) & 3) << 4)) - 32;
+    else if (group == 1) q = (int)((ql2[l + 32] & 0xF) | (((qh2[l] >> 2) & 3) << 4)) - 32;
+    else if (group == 2) q = (int)((ql2[l]      >> 4)  | (((qh2[l] >> 4) & 3) << 4)) - 32;
+    else                 q = (int)((ql2[l + 32] >> 4)  | (((qh2[l] >> 6) & 3) << 4)) - 32;
+    out[gid] = d * float(sc2[is + group * 2]) * float(q);
+}
+
+// Small-batch q6_k matmul: one thread per output ROW reads that row's quantized
+// weight ONCE and multiplies each decoded value into all `ntok` token vectors
+// (no f32 scratch, no double-read). The q6_k twin of matmul_q4k_batch, for the
+// MTP 2-token verify. ntok <= 8.
+kernel void matmul_q6k_batch(
+    device const uchar* w [[buffer(0)]], device const float* X [[buffer(1)]],
+    device float* Y [[buffer(2)]], constant uint& in_dim [[buffer(3)]],
+    constant uint& n_rows [[buffer(4)]], constant uint& ntok [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint row = gid;
+    if (row >= n_rows) return;
+    uint nsb = in_dim / 256; uint base = row * nsb * 210;
+    float acc[8]; for (uint t = 0; t < 8; ++t) acc[t] = 0.0f;
+    for (uint sb = 0; sb < nsb; ++sb) {
+        uint p = base + sb * 210;
+        device const uchar* ql = w + p; device const uchar* qh = w + p + 128;
+        device const char* sc = (device const char*)(w + p + 192);
+        float d = rdh(w, p + 208); uint xo = sb * 256;
+        for (uint n = 0; n < 2; ++n) {
+            device const uchar* ql2 = ql + n * 64; device const uchar* qh2 = qh + n * 32;
+            device const char* sc2 = sc + n * 8; uint yo = xo + n * 128;
+            for (uint l = 0; l < 32; ++l) {
+                uint is = l / 16;
+                int q1 = (int)((ql2[l]      & 0xF) | (((qh2[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql2[l + 32] & 0xF) | (((qh2[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql2[l]      >> 4)  | (((qh2[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql2[l + 32] >> 4)  | (((qh2[l] >> 6) & 3) << 4)) - 32;
+                float w1 = d * float(sc2[is + 0]) * float(q1);
+                float w2 = d * float(sc2[is + 2]) * float(q2);
+                float w3 = d * float(sc2[is + 4]) * float(q3);
+                float w4 = d * float(sc2[is + 6]) * float(q4);
+                for (uint t = 0; t < ntok; ++t) {
+                    device const float* xt = X + t * in_dim;
+                    acc[t] += w1 * xt[yo + l] + w2 * xt[yo + l + 32]
+                            + w3 * xt[yo + l + 64] + w4 * xt[yo + l + 96];
+                }
+            }
+        }
+    }
+    for (uint t = 0; t < ntok; ++t) Y[t * n_rows + row] = acc[t];
+}
+
 kernel void matvec_q5k_co(
     device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],
     device float* y [[buffer(2)]], constant uint& in_dim [[buffer(3)]],
@@ -485,6 +589,48 @@ kernel void matvec_q6k_co(
         }
     }
     for (uint r = 0; r < NDST; ++r) { float t = simd_sum(acc[r]); if (lane == 0 && row0 + r < n_rows) y[row0 + r] = t; }
+}
+
+// 2-token coalesced q6_k matmul (MTP verify): matvec_q6k_co extended to both
+// tokens — weight read once, X=[2,in_dim], Y=[2,n_rows].
+kernel void matmul_q6k_co2(
+    device const uchar* w [[buffer(0)]], device const float* X [[buffer(1)]],
+    device float* Y [[buffer(2)]], constant uint& in_dim [[buffer(3)]],
+    constant uint& n_rows [[buffer(4)]],
+    uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = (gid / 32) * NDST; uint nsb = in_dim / 256; uint sbb = nsb * 210;
+    float a0[NDST], a1[NDST];
+    for (uint r = 0; r < NDST; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; }
+    for (uint sbk = 0; sbk < nsb; ++sbk) {
+        device const uchar* ql[NDST]; device const uchar* qh[NDST]; device const char* sc[NDST]; float d[NDST];
+        for (uint r = 0; r < NDST; ++r) {
+            uint p = min(row0 + r, n_rows - 1) * sbb + sbk * 210;
+            ql[r] = w + p; qh[r] = w + p + 128; sc[r] = (device const char*)(w + p + 192); d[r] = rdh(w, p + 208);
+        }
+        uint xo = sbk * 256;
+        for (uint n = 0; n < 2; ++n) {
+            uint yo = xo + n * 128; uint is = lane / 16;
+            float x0 = X[yo + lane], x1 = X[yo + lane + 32], x2 = X[yo + lane + 64], x3 = X[yo + lane + 96];
+            float z0 = X[in_dim + yo + lane], z1 = X[in_dim + yo + lane + 32], z2 = X[in_dim + yo + lane + 64], z3 = X[in_dim + yo + lane + 96];
+            for (uint r = 0; r < NDST; ++r) {
+                device const uchar* ql2 = ql[r] + n * 64; device const uchar* qh2 = qh[r] + n * 32; device const char* sc2 = sc[r] + n * 8;
+                int q1 = (int)((ql2[lane] & 0xF) | (((qh2[lane] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql2[lane + 32] & 0xF) | (((qh2[lane] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql2[lane] >> 4) | (((qh2[lane] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql2[lane + 32] >> 4) | (((qh2[lane] >> 6) & 3) << 4)) - 32;
+                float w1 = d[r] * (float)sc2[is + 0] * (float)q1;
+                float w2 = d[r] * (float)sc2[is + 2] * (float)q2;
+                float w3 = d[r] * (float)sc2[is + 4] * (float)q3;
+                float w4 = d[r] * (float)sc2[is + 6] * (float)q4;
+                a0[r] += w1 * x0 + w2 * x1 + w3 * x2 + w4 * x3;
+                a1[r] += w1 * z0 + w2 * z1 + w3 * z2 + w4 * z3;
+            }
+        }
+    }
+    for (uint r = 0; r < NDST; ++r) {
+        float t0 = simd_sum(a0[r]); float t1 = simd_sum(a1[r]);
+        if (lane == 0 && row0 + r < n_rows) { Y[row0 + r] = t0; Y[n_rows + row0 + r] = t1; }
+    }
 }
 
 // one threadgroup of 256 threads; out = x/sqrt(mean(x^2)+eps) * w
@@ -638,6 +784,10 @@ kernel void swiglu(
 kernel void add_inplace(
     device float* x [[buffer(0)]], device const float* y [[buffer(1)]],
     uint gid [[thread_position_in_grid]]) { x[gid] += y[gid]; }
+
+kernel void copy_buf(
+    device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) { dst[gid] = src[gid]; }
 
 // ---- batched (prefill) variants: one row = one token ----
 // rmsnorm over each of N rows; one threadgroup per row.
@@ -1419,6 +1569,14 @@ pub struct Gpu {
     // Y[ntok,n_rows] = X[ntok,in_dim] @ W^T. Weight is read/dequanted ONCE and
     // reused across all `ntok` tokens (vs once-per-token in `matvec_into`).
     dequant_q4k: ComputePipelineState,
+    dequant_q6k: ComputePipelineState,
+    // register-tiled small-batch matmuls: read the quantized weight ONCE and do up
+    // to 8 tokens in registers (no f32 scratch) — the weights-read-once primitive
+    // for MTP's 2-token speculative verify. One per quant type present in Q4_K_M.
+    mm_q4k_small: ComputePipelineState,
+    mm_q6k_small: ComputePipelineState,
+    mm_q4k_2tok: ComputePipelineState, // efficient coalesced 2-token q4_k (verify)
+    mm_q6k_2tok: ComputePipelineState, // efficient coalesced 2-token q6_k (verify)
     mm_abt_reg: ComputePipelineState,
     wdq: RefCell<Option<metal::Buffer>>, // f32 scratch for one dequantized weight
     px_buf: RefCell<Option<metal::Buffer>>, // persistent batched activation input scratch
@@ -1474,7 +1632,10 @@ impl Gpu {
         // hq4 (HOS-native NF4): the coalesced kernel is parity-checked against the
         // CPU decode_hq4_into path (tests/parity_hq4.rs), so a resident HQ4 GpuMatrix
         // (e.g. the gemma4 --gpu path) matvecs on-device instead of panicking.
-        quant_mv.insert(crate::model::HQ4_TYPE, pipeline(&device, &lib2, "matvec_hq4_co"));
+        quant_mv.insert(
+            crate::model::HQ4_TYPE,
+            pipeline(&device, &lib2, "matvec_hq4_co"),
+        );
         let deltanet = device
             .new_compute_pipeline_state_with_function(
                 &lib2.get_function("deltanet", None).expect("deltanet"),
@@ -1512,6 +1673,11 @@ impl Gpu {
             )
             .expect("matmul_atb_tiled pipeline");
         let dequant_q4k = pipeline(&device, &lib2, "dequant_q4k_to_f32");
+        let dequant_q6k = pipeline(&device, &lib2, "dequant_q6k_to_f32");
+        let mm_q4k_small = pipeline(&device, &lib2, "matmul_q4k_batch");
+        let mm_q6k_small = pipeline(&device, &lib2, "matmul_q6k_batch");
+        let mm_q4k_2tok = pipeline(&device, &lib2, "matmul_q4k_co2");
+        let mm_q6k_2tok = pipeline(&device, &lib2, "matmul_q6k_co2");
         let mm_abt_reg = pipeline(&device, &lib2, "matmul_abt_reg");
         eprintln!("[hos] Metal device: {}", device.name());
         let x_buf = device.new_buffer((X_CAP * 4) as u64, MTLResourceOptions::StorageModeShared);
@@ -1536,6 +1702,11 @@ impl Gpu {
             matmul_abt_tiled,
             matmul_atb_tiled,
             dequant_q4k,
+            dequant_q6k,
+            mm_q4k_small,
+            mm_q6k_small,
+            mm_q4k_2tok,
+            mm_q6k_2tok,
             mm_abt_reg,
             wdq: RefCell::new(None),
             px_buf: RefCell::new(None),
@@ -1553,10 +1724,204 @@ impl Gpu {
     /// which re-reads+re-dequants the weight) with a single weight read — the
     /// prefill speedup. `w` MUST be a resident q4_k GpuMatrix.
     pub fn matmul_q4k_prefill_into(&self, w: &GpuMatrix, x: &[f32], ntok: usize, out: &mut [f32]) {
-        assert_eq!(
-            w.ggml_type, GGML_Q4_K,
-            "matmul_q4k_prefill_into: weight not q4_k"
+        assert_eq!(w.ggml_type, GGML_Q4_K, "matmul_q4k_prefill_into: weight not q4_k");
+        self.matmul_prefill_into(w, x, ntok, out, &self.dequant_q4k);
+    }
+
+    /// Small-batch q4_k matmul `Y[ntok,n_rows] = X[ntok,in_dim] @ Wᵀ` (ntok ≤ 8)
+    /// via the register-tiled kernel: the quantized weight is read ONCE and
+    /// multiplied into all `ntok` token vectors in registers (no f32 scratch). This
+    /// is the primitive that makes the 2-token MTP verify read weights once — the
+    /// f32-scratch prefill path only pays off past ~16 tokens.
+    pub fn matmul_q4k_small_into(&self, w: &GpuMatrix, x: &[f32], ntok: usize, out: &mut [f32]) {
+        assert_eq!(w.ggml_type, GGML_Q4_K, "matmul_q4k_small_into: weight not q4_k");
+        assert!((1..=8).contains(&ntok), "matmul_q4k_small_into: ntok must be 1..=8");
+        assert_eq!(x.len(), ntok * w.in_dim, "x shape");
+        assert_eq!(out.len(), ntok * w.n_rows, "out shape");
+        // Persistent grow-on-demand scratch (no per-call Metal buffer alloc — that
+        // churn was ~1ms/call, i.e. the whole cost, across the verify's ~250 calls).
+        let ensure = |slot: &RefCell<Option<metal::Buffer>>, floats: usize| -> metal::Buffer {
+            let need = (floats * 4) as u64;
+            let mut s = slot.borrow_mut();
+            if !s.as_ref().is_some_and(|b| b.length() >= need) {
+                *s = Some(
+                    self.device
+                        .new_buffer(need, MTLResourceOptions::StorageModeShared),
+                );
+            }
+            s.as_ref().unwrap().clone()
+        };
+        let xbuf = ensure(&self.px_buf, x.len());
+        let ybuf = ensure(&self.py_buf, out.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), xbuf.contents() as *mut f32, x.len());
+        }
+        let (in32, nr32, nt32) = (w.in_dim as u32, w.n_rows as u32, ntok as u32);
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.mm_q4k_small);
+        enc.set_buffer(0, Some(&w.buf), 0);
+        enc.set_buffer(1, Some(&xbuf), 0);
+        enc.set_buffer(2, Some(&ybuf), 0);
+        enc.set_bytes(3, 4, &in32 as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &nr32 as *const u32 as *const c_void);
+        enc.set_bytes(5, 4, &nt32 as *const u32 as *const c_void);
+        enc.dispatch_threads(
+            MTLSize::new((w.n_rows * 32) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
         );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        let ptr = ybuf.contents() as *const f32;
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, out.len()) });
+    }
+
+    /// Efficient 2-token q4_k matmul (MTP verify): coalesced NDST-rows-per-simdgroup
+    /// like the single-token decode kernel, so it runs at ~decode speed but produces
+    /// BOTH tokens from one weight read.
+    pub fn matmul_q4k_2tok_into(&self, w: &GpuMatrix, x: &[f32], out: &mut [f32]) {
+        assert_eq!(w.ggml_type, GGML_Q4_K, "matmul_q4k_2tok_into: weight not q4_k");
+        assert_eq!(x.len(), 2 * w.in_dim, "x shape");
+        assert_eq!(out.len(), 2 * w.n_rows, "out shape");
+        let ensure = |slot: &RefCell<Option<metal::Buffer>>, floats: usize| -> metal::Buffer {
+            let need = (floats * 4) as u64;
+            let mut s = slot.borrow_mut();
+            if !s.as_ref().is_some_and(|b| b.length() >= need) {
+                *s = Some(
+                    self.device
+                        .new_buffer(need, MTLResourceOptions::StorageModeShared),
+                );
+            }
+            s.as_ref().unwrap().clone()
+        };
+        let xbuf = ensure(&self.px_buf, x.len());
+        let ybuf = ensure(&self.py_buf, out.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), xbuf.contents() as *mut f32, x.len());
+        }
+        let (in32, nr32) = (w.in_dim as u32, w.n_rows as u32);
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.mm_q4k_2tok);
+        enc.set_buffer(0, Some(&w.buf), 0);
+        enc.set_buffer(1, Some(&xbuf), 0);
+        enc.set_buffer(2, Some(&ybuf), 0);
+        enc.set_bytes(3, 4, &in32 as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &nr32 as *const u32 as *const c_void);
+        let simdgroups = (w.n_rows as u64).div_ceil(2);
+        enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(32, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        let ptr = ybuf.contents() as *const f32;
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, out.len()) });
+    }
+
+    /// Efficient 2-token q6_k matmul (MTP verify): coalesced, weight read once.
+    pub fn matmul_q6k_2tok_into(&self, w: &GpuMatrix, x: &[f32], out: &mut [f32]) {
+        assert_eq!(w.ggml_type, GGML_Q6_K, "matmul_q6k_2tok_into: weight not q6_k");
+        assert_eq!(x.len(), 2 * w.in_dim, "x shape");
+        assert_eq!(out.len(), 2 * w.n_rows, "out shape");
+        let ensure = |slot: &RefCell<Option<metal::Buffer>>, floats: usize| -> metal::Buffer {
+            let need = (floats * 4) as u64;
+            let mut s = slot.borrow_mut();
+            if !s.as_ref().is_some_and(|b| b.length() >= need) {
+                *s = Some(
+                    self.device
+                        .new_buffer(need, MTLResourceOptions::StorageModeShared),
+                );
+            }
+            s.as_ref().unwrap().clone()
+        };
+        let xbuf = ensure(&self.px_buf, x.len());
+        let ybuf = ensure(&self.py_buf, out.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), xbuf.contents() as *mut f32, x.len());
+        }
+        let (in32, nr32) = (w.in_dim as u32, w.n_rows as u32);
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.mm_q6k_2tok);
+        enc.set_buffer(0, Some(&w.buf), 0);
+        enc.set_buffer(1, Some(&xbuf), 0);
+        enc.set_buffer(2, Some(&ybuf), 0);
+        enc.set_bytes(3, 4, &in32 as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &nr32 as *const u32 as *const c_void);
+        let simdgroups = (w.n_rows as u64).div_ceil(2);
+        enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(32, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        let ptr = ybuf.contents() as *const f32;
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, out.len()) });
+    }
+
+    /// q6_k twin of `matmul_q4k_small_into` (one thread per output row, weight read
+    /// once for all `ntok` tokens). Lets the MTP verify batch the q6_k weights
+    /// (ffn_down, attn_v) instead of reading them twice per 2-token step.
+    pub fn matmul_q6k_small_into(&self, w: &GpuMatrix, x: &[f32], ntok: usize, out: &mut [f32]) {
+        assert_eq!(w.ggml_type, GGML_Q6_K, "matmul_q6k_small_into: weight not q6_k");
+        assert!((1..=8).contains(&ntok), "matmul_q6k_small_into: ntok must be 1..=8");
+        assert_eq!(x.len(), ntok * w.in_dim, "x shape");
+        assert_eq!(out.len(), ntok * w.n_rows, "out shape");
+        let ensure = |slot: &RefCell<Option<metal::Buffer>>, floats: usize| -> metal::Buffer {
+            let need = (floats * 4) as u64;
+            let mut s = slot.borrow_mut();
+            if !s.as_ref().is_some_and(|b| b.length() >= need) {
+                *s = Some(
+                    self.device
+                        .new_buffer(need, MTLResourceOptions::StorageModeShared),
+                );
+            }
+            s.as_ref().unwrap().clone()
+        };
+        let xbuf = ensure(&self.px_buf, x.len());
+        let ybuf = ensure(&self.py_buf, out.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), xbuf.contents() as *mut f32, x.len());
+        }
+        let (in32, nr32, nt32) = (w.in_dim as u32, w.n_rows as u32, ntok as u32);
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.mm_q6k_small);
+        enc.set_buffer(0, Some(&w.buf), 0);
+        enc.set_buffer(1, Some(&xbuf), 0);
+        enc.set_buffer(2, Some(&ybuf), 0);
+        enc.set_bytes(3, 4, &in32 as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &nr32 as *const u32 as *const c_void);
+        enc.set_bytes(5, 4, &nt32 as *const u32 as *const c_void);
+        enc.dispatch_threads(
+            MTLSize::new(w.n_rows as u64, 1, 1),
+            MTLSize::new(64, 1, 1),
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        let ptr = ybuf.contents() as *const f32;
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, out.len()) });
+    }
+
+    /// Batched prefill for a q6_k weight — mirror of the q4_k path with the q6_k
+    /// dequant kernel. Lets qwen35 Q4_K_M batch its q6_k weights (ffn_down/attn_v)
+    /// instead of falling back to per-token. Additive: q4_k path unchanged.
+    pub fn matmul_q6k_prefill_into(&self, w: &GpuMatrix, x: &[f32], ntok: usize, out: &mut [f32]) {
+        assert_eq!(w.ggml_type, GGML_Q6_K, "matmul_q6k_prefill_into: weight not q6_k");
+        self.matmul_prefill_into(w, x, ntok, out, &self.dequant_q6k);
+    }
+
+    /// Shared batched prefill: dequant the whole weight to f32 scratch ONCE via
+    /// `dequant`, then a register-tiled GEMM over all `ntok` tokens (weight read
+    /// once, not once-per-token). The GEMM is quant-agnostic — only the dequant
+    /// kernel differs per type.
+    fn matmul_prefill_into(
+        &self,
+        w: &GpuMatrix,
+        x: &[f32],
+        ntok: usize,
+        out: &mut [f32],
+        dequant: &ComputePipelineState,
+    ) {
         assert_eq!(x.len(), ntok * w.in_dim, "x shape");
         assert_eq!(out.len(), ntok * w.n_rows, "out shape");
         let (in_dim, n_rows) = (w.in_dim, w.n_rows);
@@ -1587,7 +1952,7 @@ impl Gpu {
         // then a register-tiled GEMM: C[M,K]=A[M,Nc]@B[K,Nc]^T, A=x, B=wdq
         // (M=ntok, Nc=in_dim, K=n_rows). This beat the shared-memory prefill kernel
         // on M4 Max for Gemma4's dims. Metal hazard tracking serializes the two.
-        enc.set_compute_pipeline_state(&self.dequant_q4k);
+        enc.set_compute_pipeline_state(dequant);
         enc.set_buffer(0, Some(&w.buf), 0);
         enc.set_buffer(1, Some(&wdq), 0);
         enc.set_bytes(2, 4, &in32 as *const u32 as *const c_void);

@@ -52,7 +52,13 @@ fn path_for(id: &str) -> PathBuf {
 /// Upsert a transcript. `messages` come from the client; `model` provenance and
 /// `params` are stamped by the caller (server-authoritative). The original
 /// `created` time is preserved across updates.
-pub fn save(id: &str, messages: &Value, model: Value, params: Value) -> std::io::Result<Value> {
+pub fn save(
+    id: &str,
+    messages: &Value,
+    model: Value,
+    params: Value,
+    memory: Value,
+) -> std::io::Result<Value> {
     std::fs::create_dir_all(dir())?;
     let p = path_for(id);
     let created = std::fs::read(&p)
@@ -69,7 +75,7 @@ pub fn save(id: &str, messages: &Value, model: Value, params: Value) -> std::io:
     let rec = json!({
         "id": id, "created": created, "updated": now(),
         "title": title, "model": model, "params": params,
-        "messages": messages,
+        "messages": messages, "memory": memory,
     });
     std::fs::write(&p, serde_json::to_string_pretty(&rec)?)?;
     Ok(json!({ "id": id, "title": title, "created": created }))

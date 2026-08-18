@@ -323,6 +323,9 @@ a missing, malformed, or unsupported model returns a clean error, not a panic.
 | `HOS_MODEL` | engine | Default model path. |
 | `FLWR_STORE` / `HOS_STORE` | flwr | Model store location. |
 | `FLWR_CHATS` | flwr | Chat-transcript directory. |
+| `FLWR_CONTEXT_TOKENS` | flwr | Approximate prompt budget before compacting long conversations. |
+| `FLWR_RECENT_TURNS` | flwr | Recent messages kept verbatim after compaction. |
+| `FLWR_MEMORY_BATCH_MESSAGES` | flwr | Messages per stable summary receipt. |
 | `FT_LR` / `FT_GPU` / `FT_GROW_FFN` / `FT_FLWR` / `FT_VIZ` | fine-tune | Fine-tuning knobs. |
 | `LM_STEPS` / `LM_GPU` | train-lm | Char-LM training knobs. |
 | `PEFT_LR` / `PEFT_T` / `PEFT_LAMBDA` / `PEFT_GPU` | RGA | Adapter-training knobs. |

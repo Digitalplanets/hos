@@ -243,7 +243,9 @@ fn pull_registry(base: &str, name: &str, name_override: Option<&str>) {
         .unwrap_or_else(|| fail(&format!("registry response for '{name}' has no 'url'")));
     let want_sha = v["sha256"].as_str().unwrap_or("");
 
-    let store_name = name_override.map(String::from).unwrap_or_else(|| name.to_string());
+    let store_name = name_override
+        .map(String::from)
+        .unwrap_or_else(|| name.to_string());
     let file = format!("{store_name}.hos");
     let dir = store_root().join(&store_name);
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| fail(&format!("mkdir: {e}")));
@@ -258,7 +260,9 @@ fn pull_registry(base: &str, name: &str, name_override: Option<&str>) {
             Some(got) if got.eq_ignore_ascii_case(want_sha) => eprintln!("    ✓ sha256 verified"),
             Some(got) => {
                 let _ = std::fs::remove_dir_all(&dir);
-                fail(&format!("sha256 mismatch (hub {want_sha}, got {got}) — refused"));
+                fail(&format!(
+                    "sha256 mismatch (hub {want_sha}, got {got}) — refused"
+                ));
             }
             None => eprintln!("    ! no sha256 tool found — kept UNVERIFIED"),
         }
@@ -296,7 +300,10 @@ fn sha256_file(path: &Path) -> Option<String> {
     for (bin, args) in attempts {
         if let Ok(out) = Command::new(bin).args(args).arg(path).output() {
             if out.status.success() {
-                if let Some(hex) = String::from_utf8_lossy(&out.stdout).split_whitespace().next() {
+                if let Some(hex) = String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .next()
+                {
                     return Some(hex.to_lowercase());
                 }
             }

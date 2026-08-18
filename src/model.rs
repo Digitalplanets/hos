@@ -311,6 +311,86 @@ impl Weight {
             }
         }
     }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            Weight::Cpu { rows, .. } | Weight::Quant { rows, .. } => *rows,
+            Weight::Gpu(m) => m.n_rows,
+        }
+    }
+
+    pub fn cols(&self) -> usize {
+        match self {
+            Weight::Cpu { cols, .. } | Weight::Quant { cols, .. } => *cols,
+            Weight::Gpu(m) => m.in_dim,
+        }
+    }
+
+    /// Batched prefill matvec: `Y[ntok,rows] = X[ntok,cols] @ Wᵀ`, reading each
+    /// weight ONCE across all tokens when eligible (q4_k GPU weight → batched
+    /// kernel). Every other type/quant (q6_k, f16, CPU, native quants) falls back
+    /// to a per-token `matvec` loop — correct, just not batched. Purely additive:
+    /// no existing path changes, and any model/quant still works.
+    pub fn matvec_batch(&self, gpu: Option<&Gpu>, x: &[f32], ntok: usize, out: &mut [f32]) {
+        // Batched GPU paths, by token count:
+        //  - 2..=8 tokens (e.g. MTP's 2-token verify): register-tiled kernel that
+        //    reads the quantized weight ONCE, no f32 scratch — the small-batch win.
+        //  - >=32 tokens (prefill): dequant-to-f32-scratch kernel, amortized.
+        // Between/at 1: per-token matvec (fallthrough).
+        if let Weight::Gpu(m) = self {
+            let g = gpu.expect("gpu weight needs a Gpu context");
+            if ntok == 2 {
+                // efficient coalesced 2-token path (MTP verify)
+                if m.ggml_type == crate::gguf::GGML_Q4_K {
+                    g.matmul_q4k_2tok_into(m, x, out);
+                    return;
+                }
+                if m.ggml_type == crate::gguf::GGML_Q6_K {
+                    g.matmul_q6k_2tok_into(m, x, out);
+                    return;
+                }
+            }
+            if (2..=8).contains(&ntok) {
+                if m.ggml_type == crate::gguf::GGML_Q4_K {
+                    g.matmul_q4k_small_into(m, x, ntok, out);
+                    return;
+                }
+                if m.ggml_type == crate::gguf::GGML_Q6_K {
+                    g.matmul_q6k_small_into(m, x, ntok, out);
+                    return;
+                }
+            }
+            if ntok >= 32 {
+                if m.ggml_type == crate::gguf::GGML_Q4_K {
+                    g.matmul_q4k_prefill_into(m, x, ntok, out);
+                    return;
+                }
+                if m.ggml_type == crate::gguf::GGML_Q6_K {
+                    g.matmul_q6k_prefill_into(m, x, ntok, out);
+                    return;
+                }
+            }
+        }
+        // CPU (or a GPU weight with no batched kernel for this ntok): a quantized/f32
+        // weight batches through `cpu_matmat`, which dequantizes each row ONCE and
+        // dots it against all `ntok` tokens — the prompt-processing win on x86/Windows
+        // (per-token `matvec` would re-dequantize the whole weight for every token).
+        // Bit-identical to the per-token loop (same dequant + same `dot_f32`). A GPU
+        // weight reaching here (no kernel for this ntok/type) still goes per-token.
+        match self {
+            Weight::Gpu(_) => {
+                let (cols, rows) = (self.cols(), self.rows());
+                for t in 0..ntok {
+                    self.matvec(
+                        gpu,
+                        &x[t * cols..t * cols + cols],
+                        &mut out[t * rows..(t + 1) * rows],
+                    );
+                }
+            }
+            _ => cpu_matmat(out, self, x, ntok),
+        }
+    }
 }
 
 /// Fused quantized matvec: read the compressed weight bytes and dequantize one

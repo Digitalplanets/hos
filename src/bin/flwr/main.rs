@@ -13,6 +13,8 @@
 
 mod chats;
 mod gemma4_chat;
+mod memory;
+mod reasoning;
 mod serve;
 mod store;
 
@@ -38,6 +40,26 @@ struct Opts {
     dest: Option<String>,
     qtype: String,
     awq: bool,
+    no_think: bool,
+    effort: Option<String>,
+    hide_thinking: bool,
+    image: Option<String>,
+    mmproj: Option<String>,
+}
+
+impl Opts {
+    /// Thinking config for hybrid reasoning models (qwen35).
+    fn think(&self) -> hos::qwen35::Think {
+        let effort = self
+            .effort
+            .as_deref()
+            .and_then(hos::qwen35::Effort::parse)
+            .unwrap_or(hos::qwen35::Effort::Xhigh);
+        hos::qwen35::Think {
+            on: !self.no_think,
+            effort,
+        }
+    }
 }
 
 fn usage() -> ! {
@@ -83,6 +105,11 @@ fn parse() -> Opts {
         dest: None,
         qtype: "q8_0".to_string(),
         awq: false,
+        no_think: false,
+        effort: None,
+        hide_thinking: false,
+        image: None,
+        mmproj: None,
     };
     let mut it = std::env::args().skip(1);
     o.cmd = it.next().unwrap_or_default();
@@ -111,6 +138,11 @@ fn parse() -> Opts {
             "--awq" => o.awq = true,
             "--gpu" => o.gpu = true,
             "--cpu" => o.gpu = false,
+            "--no-think" | "--no-thinking" => o.no_think = true,
+            "--effort" | "--reasoning-effort" => o.effort = it.next(),
+            "--hide-thinking" | "--hide-reasoning" => o.hide_thinking = true,
+            "--image" | "--img" => o.image = it.next(),
+            "--mmproj" => o.mmproj = it.next(),
             other if !other.starts_with('-') && o.model.is_none() => {
                 o.model = Some(other.to_string())
             }
@@ -132,6 +164,7 @@ fn main() {
     match o.cmd.as_str() {
         "run" => cmd_run(&o),
         "serve" => cmd_serve(&o),
+        "membench" | "bench-memory" => cmd_membench(&o),
         "bloom" | "viz" => cmd_bloom(),
         "pull" => {
             let spec = o.model.clone().unwrap_or_else(|| {
@@ -184,6 +217,14 @@ fn cmd_run(o: &Opts) {
         gemma4_chat::run(&path, &gemma4_opts(o));
         return;
     }
+    // qwen35 hybrid (Gated-DeltaNet + attention) is a custom HOS arch on its own
+    // ChatSession backend; everything else stays on the generic Engine.
+    if let Ok(g) = hos::gguf::Gguf::open(&path) {
+        if hos::model::Arch::detect(&g) == hos::model::Arch::Qwen35Hybrid {
+            cmd_run_qwen35(&path, o);
+            return;
+        }
+    }
     let name = model_name_of(&path);
     let mut eng = load(&path, o.gpu);
     let backend = if o.gpu { "metal gpu" } else { "cpu" };
@@ -226,7 +267,19 @@ fn cmd_run(o: &Opts) {
     }
 
     organism_banner(&eng, &name, backend);
+    println!(
+        "    {}/role <text> · /continue · /list · /open <id> · /new · /bye{}",
+        hos::viz::faint(),
+        hos::viz::RESET
+    );
     let mut history: Vec<hos::chat::Message> = Vec::new();
+    let mut last_memory_sig = String::new();
+    let mut chat_id = crate::chats::new_id();
+    let model_meta = serde_json::json!({ "name": name.clone() });
+    let params_meta = serde_json::json!({
+        "temp": o.temp, "top_k": o.top_k, "top_p": o.top_p,
+        "n_predict": o.n_predict, "seed": o.seed, "gpu": o.gpu,
+    });
     let stdin = std::io::stdin();
     loop {
         print!(
@@ -243,21 +296,582 @@ fn cmd_run(o: &Opts) {
             Err(_) => break,
         }
         let text = line.trim();
-        match text {
-            "" => continue,
-            "/bye" | "/exit" | "/quit" => break,
-            "/reset" => {
-                history.clear();
-                println!("    · memory cleared.\n");
-                continue;
-            }
-            _ => {}
+        if text.is_empty() {
+            continue;
         }
+        if matches!(text, "/bye" | "/exit" | "/quit") {
+            break;
+        }
+        if matches!(text, "/reset" | "/new") {
+            history.clear();
+            chat_id = crate::chats::new_id();
+            println!("    · new conversation.\n");
+            continue;
+        }
+        if matches!(text, "/list" | "/chats") {
+            print_chat_list();
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix("/open") {
+            let id = rest.trim();
+            if id.is_empty() {
+                println!("    · usage: /open <id>   (see /list)\n");
+            } else if let Some(msgs) = load_chat_history(id) {
+                history = msgs;
+                chat_id = id.to_string();
+                replay_history(&history);
+            } else {
+                println!("    · no chat '{id}'. try /list\n");
+            }
+            continue;
+        }
+        if matches!(text, "/continue" | "/resume") {
+            match most_recent_saved_chat().filter(|id| load_chat_history(id).is_some()) {
+                Some(id) => {
+                    history = load_chat_history(&id).unwrap();
+                    chat_id = id;
+                    replay_history(&history);
+                }
+                None => println!("    · no saved conversation to continue.\n"),
+            }
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix("/role") {
+            let r = rest.trim();
+            let has_sys = history.first().map(|m| m.role == "system").unwrap_or(false);
+            if r.is_empty() {
+                match history.first().filter(|m| m.role == "system") {
+                    Some(m) => println!("    · role: {}\n", m.content),
+                    None => println!(
+                        "    · no role set. usage: /role <instruction>   ·   /role clear\n"
+                    ),
+                }
+            } else if matches!(r, "clear" | "none" | "off") {
+                if has_sys {
+                    history.remove(0);
+                }
+                println!("    · role cleared.\n");
+            } else {
+                let sys = hos::chat::Message::new("system", r);
+                if has_sys {
+                    history[0] = sys;
+                } else {
+                    history.insert(0, sys);
+                }
+                println!("    · role set. the model follows it for this conversation.\n");
+            }
+            continue;
+        }
+        if text.starts_with('/') {
+            println!(
+                "    · commands:  /role <text>   /list   /open <id>   /continue   /new   /bye\n"
+            );
+            continue;
+        }
+
         history.push(hos::chat::Message::new("user", text));
-        let reply = turn(&mut eng, &history);
+        let bundle = memory::assemble(&history);
+        let sig = memory::receipt_signature(&bundle.memory);
+        if bundle.omitted_messages > 0 && (memory::debug_compaction() || sig != last_memory_sig) {
+            eprintln!(
+                "    · using memory receipts for {} older messages (~{} tok prompt)",
+                bundle.omitted_messages, bundle.estimated_tokens
+            );
+        }
+        last_memory_sig = sig;
+        let reply = turn(&mut eng, &bundle.messages);
         history.push(hos::chat::Message::new("assistant", reply.trim()));
+
+        // Autosave so the conversation can be reopened with /open.
+        let _ = crate::chats::save(
+            &chat_id,
+            &history_to_json(&history),
+            model_meta.clone(),
+            params_meta.clone(),
+            memory::to_json(&bundle.memory),
+        );
+    }
+    if !history.is_empty() {
+        println!("    · saved. continue later with:  /open {chat_id}");
     }
     println!("    · session closed.");
+}
+
+/// Look for an `mmproj-*.gguf` (the vision tower) next to the model, so `--image`
+/// works without the user pointing at it explicitly.
+fn find_sibling_mmproj(model: &Path) -> Option<String> {
+    let dir = model.parent()?;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let n = e.file_name();
+        let name = n.to_string_lossy();
+        if name.starts_with("mmproj") && name.ends_with(".gguf") {
+            return Some(e.path().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// `flwr run <qwen35>` — the same interactive/one-shot chat REPL as `cmd_run`,
+/// but driven by the qwen35 `ChatSession` backend (Gated-DeltaNet hybrid). Reuses
+/// the shared memory + persistence helpers, so /role /list /open /continue all work.
+fn cmd_run_qwen35(path: &Path, o: &Opts) {
+    use std::io::Write;
+    let name = model_name_of(path);
+    let backend = if o.gpu { "metal gpu" } else { "cpu" };
+    let g = match hos::gguf::Gguf::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[flwr] cannot open model: {e}");
+            return;
+        }
+    };
+    let tok = match hos::tokenizer::Tokenizer::from_gguf(&g) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[flwr] tokenizer: {e}");
+            return;
+        }
+    };
+    let mut sess = match hos::qwen35::ChatSession::load(&g, tok, o.gpu) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[flwr] load: {e}");
+            return;
+        }
+    };
+
+    // Vision: with --image, attach the tower (from --mmproj or an auto-detected
+    // sibling mmproj-*.gguf) and encode the image once; it's spliced into every
+    // turn's last user message so the whole conversation can reference it.
+    let img_emb: Option<Vec<f32>> = match &o.image {
+        Some(imgp) => {
+            let mm = o.mmproj.clone().or_else(|| find_sibling_mmproj(path));
+            match mm.and_then(|p| hos::gguf::Gguf::open(std::path::Path::new(&p)).ok()) {
+                Some(mg) => match sess.attach_vision(&mg).and_then(|_| {
+                    eprintln!("[flwr] encoding image {imgp} ...");
+                    sess.encode_image(std::path::Path::new(imgp))
+                }) {
+                    Ok(e) => {
+                        eprintln!("[flwr] image -> {} vision tokens", e.len() / 5120);
+                        Some(e)
+                    }
+                    Err(e) => {
+                        eprintln!("[flwr] vision: {e}");
+                        None
+                    }
+                },
+                None => {
+                    eprintln!("[flwr] --image needs --mmproj <mmproj.gguf> (or a sibling mmproj-*.gguf)");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let img_ref = img_emb.as_deref();
+
+    let think = o.think();
+    let hide = o.hide_thinking;
+    let effort_label = match think.effort {
+        hos::qwen35::Effort::Low => "low",
+        hos::qwen35::Effort::Medium => "medium",
+        hos::qwen35::Effort::Xhigh => "xhigh",
+    };
+    // Returns (answer, reasoning_trace, tokens). The answer goes to history; the
+    // reasoning is streamed dimmed AND kept for a content-addressed receipt.
+    let turn = |sess: &mut hos::qwen35::ChatSession,
+                history: &[hos::chat::Message]|
+     -> (String, String, usize) {
+        use hos::qwen35::Chunk;
+        print!(
+            "  {}{}flwr{}  ",
+            hos::viz::BOLD,
+            hos::viz::petal(),
+            hos::viz::RESET
+        );
+        std::io::stdout().flush().ok();
+        let mut reply = String::new();
+        let mut reasoning = String::new();
+        let mut in_reason = false;
+        let n = sess.chat_img(
+            history,
+            img_ref,
+            think,
+            o.n_predict,
+            o.temp,
+            o.top_k,
+            o.top_p,
+            o.rep_penalty,
+            o.repeat_last_n,
+            o.seed,
+            |chunk| {
+                match chunk {
+                    Chunk::Reasoning(t) => {
+                        reasoning.push_str(t);
+                        if !hide {
+                            if !in_reason {
+                                print!("{}", hos::viz::faint());
+                                in_reason = true;
+                            }
+                            print!("{t}");
+                        }
+                    }
+                    Chunk::Answer(t) => {
+                        if in_reason {
+                            print!("{}\n\n  ", hos::viz::RESET);
+                            in_reason = false;
+                        }
+                        print!("{t}");
+                        reply.push_str(t);
+                    }
+                }
+                std::io::stdout().flush().ok();
+            },
+        );
+        if in_reason {
+            print!("{}", hos::viz::RESET);
+        }
+        println!("\n");
+        (reply, reasoning, n)
+    };
+
+    // one-shot mode.
+    if let Some(p) = &o.prompt {
+        print!("{}", hos::viz::banner());
+        let history = vec![hos::chat::Message::new("user", p)];
+        let (answer, reasoning, n) = turn(&mut sess, &history);
+        let rr = reasoning::ReasoningReceipt::new(
+            "oneshot", 0, p, effort_label, &reasoning, &answer, n,
+            serde_json::json!({ "name": name }),
+        );
+        if let Ok(Some(id)) = reasoning::save(&rr) {
+            eprintln!("    · reasoning receipt {id}");
+        }
+        return;
+    }
+
+    qwen35_banner(&sess, &name, backend);
+    println!(
+        "    {}/role <text> · /continue · /list · /open <id> · /new · /bye{}",
+        hos::viz::faint(),
+        hos::viz::RESET
+    );
+    let mut history: Vec<hos::chat::Message> = Vec::new();
+    let mut last_memory_sig = String::new();
+    let mut chat_id = crate::chats::new_id();
+    let model_meta = serde_json::json!({ "name": name.clone() });
+    let params_meta = serde_json::json!({
+        "temp": o.temp, "top_k": o.top_k, "top_p": o.top_p,
+        "n_predict": o.n_predict, "seed": o.seed, "gpu": o.gpu,
+    });
+    let stdin = std::io::stdin();
+    loop {
+        print!(
+            "  {}{}you{}   ",
+            hos::viz::BOLD,
+            hos::viz::faint(),
+            hos::viz::RESET
+        );
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if matches!(text, "/bye" | "/exit" | "/quit") {
+            break;
+        }
+        if matches!(text, "/reset" | "/new") {
+            history.clear();
+            chat_id = crate::chats::new_id();
+            println!("    · new conversation.\n");
+            continue;
+        }
+        if matches!(text, "/list" | "/chats") {
+            print_chat_list();
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix("/open") {
+            let id = rest.trim();
+            if id.is_empty() {
+                println!("    · usage: /open <id>   (see /list)\n");
+            } else if let Some(msgs) = load_chat_history(id) {
+                history = msgs;
+                chat_id = id.to_string();
+                replay_history(&history);
+            } else {
+                println!("    · no chat '{id}'. try /list\n");
+            }
+            continue;
+        }
+        if matches!(text, "/continue" | "/resume") {
+            match most_recent_saved_chat().filter(|id| load_chat_history(id).is_some()) {
+                Some(id) => {
+                    history = load_chat_history(&id).unwrap();
+                    chat_id = id;
+                    replay_history(&history);
+                }
+                None => println!("    · no saved conversation to continue.\n"),
+            }
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix("/role") {
+            let r = rest.trim();
+            let has_sys = history.first().map(|m| m.role == "system").unwrap_or(false);
+            if r.is_empty() {
+                match history.first().filter(|m| m.role == "system") {
+                    Some(m) => println!("    · role: {}\n", m.content),
+                    None => {
+                        println!("    · no role set. usage: /role <instruction>   ·   /role clear\n")
+                    }
+                }
+            } else if matches!(r, "clear" | "none" | "off") {
+                if has_sys {
+                    history.remove(0);
+                }
+                println!("    · role cleared.\n");
+            } else {
+                let sys = hos::chat::Message::new("system", r);
+                if has_sys {
+                    history[0] = sys;
+                } else {
+                    history.insert(0, sys);
+                }
+                println!("    · role set. the model follows it for this conversation.\n");
+            }
+            continue;
+        }
+        if text.starts_with('/') {
+            println!(
+                "    · commands:  /role <text>   /list   /open <id>   /continue   /new   /bye\n"
+            );
+            continue;
+        }
+
+        history.push(hos::chat::Message::new("user", text));
+        let bundle = memory::assemble(&history);
+        let sig = memory::receipt_signature(&bundle.memory);
+        if bundle.omitted_messages > 0 && (memory::debug_compaction() || sig != last_memory_sig) {
+            eprintln!(
+                "    · using memory receipts for {} older messages (~{} tok prompt)",
+                bundle.omitted_messages, bundle.estimated_tokens
+            );
+        }
+        last_memory_sig = sig;
+        let (reply, reasoning, n) = turn(&mut sess, &bundle.messages);
+        history.push(hos::chat::Message::new("assistant", reply.trim()));
+        // Capture the reasoning as a content-addressed receipt agents can build on.
+        let rr = reasoning::ReasoningReceipt::new(
+            &chat_id,
+            history.len().saturating_sub(1),
+            text,
+            effort_label,
+            &reasoning,
+            &reply,
+            n,
+            model_meta.clone(),
+        );
+        if let Ok(Some(id)) = reasoning::save(&rr) {
+            if memory::debug_compaction() {
+                eprintln!("    · reasoning receipt {id}");
+            }
+        }
+        let _ = crate::chats::save(
+            &chat_id,
+            &history_to_json(&history),
+            model_meta.clone(),
+            params_meta.clone(),
+            memory::to_json(&bundle.memory),
+        );
+    }
+    if !history.is_empty() {
+        println!("    · saved. continue later with:  /open {chat_id}");
+    }
+    println!("    · session closed.");
+}
+
+/// Compact organism banner for the qwen35 ChatSession backend.
+fn qwen35_banner(sess: &hos::qwen35::ChatSession, name: &str, backend: &str) {
+    use hos::viz::*;
+    let (dim, n_layers, n_heads, n_kv, ctx_len) = sess.dims();
+    let back_col = if backend.contains("gpu") {
+        signal()
+    } else {
+        faint()
+    };
+    print!("{}", banner());
+    let lines = vec![
+        format!(
+            "{}body{}     {}{name}{}  {}(qwen35 hybrid){}",
+            BOLD,
+            RESET,
+            petal(),
+            RESET,
+            faint(),
+            RESET
+        ),
+        format!(
+            "{}anatomy{}  {}dim {} · {} layers · {}h/{}kv · ctx {}{}",
+            BOLD, RESET, ink(), dim, n_layers, n_heads, n_kv, ctx_len, RESET
+        ),
+        format!(
+            "{}dialect{}  {}{}{}",
+            BOLD,
+            RESET,
+            ctx(),
+            sess.family_label(),
+            RESET
+        ),
+        format!("{}backend{}  {}{}{}", BOLD, RESET, back_col, backend, RESET),
+        format!(
+            "{}engine{}   {}gated-deltanet + attention · Powered by HOS{}",
+            BOLD,
+            RESET,
+            faint(),
+            RESET
+        ),
+        String::new(),
+        status("BLOOM STATE: READY", &stem()),
+        format!("{}/bye ends · /reset clears memory{}", faint(), RESET),
+    ];
+    println!("{}", frame("FLWR // CHAT", &lines, 44));
+    print!("{}", footer_nav());
+}
+
+fn history_to_json(history: &[hos::chat::Message]) -> serde_json::Value {
+    serde_json::Value::Array(
+        history
+            .iter()
+            .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+            .collect(),
+    )
+}
+
+fn load_chat_history(id: &str) -> Option<Vec<hos::chat::Message>> {
+    let raw = crate::chats::load(id)?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(memory::messages_from_json(&v["messages"]))
+}
+
+fn replay_history(history: &[hos::chat::Message]) {
+    use hos::viz::*;
+    println!();
+    for m in history {
+        if m.role == "system" {
+            continue;
+        }
+        let (label, col) = if m.role == "assistant" {
+            ("flwr", petal())
+        } else {
+            ("you ", faint())
+        };
+        println!("  {BOLD}{col}{label}{RESET}   {}", m.content);
+    }
+    println!("    · continuing this conversation.\n");
+}
+
+fn print_chat_list() {
+    use hos::viz::*;
+    let list = crate::chats::list();
+    let items = list["data"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        println!("    · no saved conversations yet.\n");
+        return;
+    }
+    println!();
+    for it in items.iter().take(20) {
+        let id = it["id"].as_str().unwrap_or("?");
+        let title = it["title"].as_str().unwrap_or("untitled");
+        let n = it["messages"].as_u64().unwrap_or(0);
+        println!("  {}{id}{RESET}  {}{title}{RESET}  {}({n} msgs){RESET}", pollen(), ink(), faint());
+    }
+    println!("    · open one with:  /open <id>\n");
+}
+
+/// `flwr membench [chat-id]` — measure conversation compression: raw vs packed
+/// tokens, ratio, omitted messages, and whether the packed prompt stayed within
+/// budget, across a range of context budgets. Uses a saved chat if given (or the
+/// largest one on disk), else a synthetic long conversation.
+fn cmd_membench(o: &Opts) {
+    use hos::viz::*;
+    let (src, msgs): (String, Vec<hos::chat::Message>) = match o.model.as_deref() {
+        Some(s) if load_chat_history(s).is_some() => {
+            (format!("chat {s}"), load_chat_history(s).unwrap())
+        }
+        // Only auto-pick a saved chat if it is long enough to actually compress;
+        // otherwise use the synthetic conversation that demonstrates the ratios.
+        _ => match largest_saved_chat()
+            .filter(|id| load_chat_history(id).map(|m| m.len() >= 24).unwrap_or(false))
+        {
+            Some(id) => (format!("saved chat {id}"), load_chat_history(&id).unwrap_or_default()),
+            None => ("synthetic 200-turn conversation".to_string(), synthetic_convo()),
+        },
+    };
+    let msgs = if msgs.is_empty() { synthetic_convo() } else { msgs };
+
+    let raw = memory::raw_tokens(&msgs);
+    println!();
+    println!("  {BOLD}MEMORY BENCHMARK{RESET}   source: {src}");
+    println!(
+        "  {} messages · ~{raw} raw tokens · recent window {} turns\n",
+        msgs.len(),
+        memory::recent_turns()
+    );
+    println!(
+        "  {BOLD}{:>8}  {:>10}  {:>10}  {:>7}  {:>8}  within?{RESET}",
+        "budget", "raw tok", "packed", "ratio", "omitted"
+    );
+    for budget in [512usize, 1024, 2048, 3072, 4096] {
+        let b = memory::assemble_with(&msgs, budget, memory::recent_turns());
+        let ratio = raw as f64 / b.estimated_tokens.max(1) as f64;
+        let mark = if b.estimated_tokens <= budget {
+            format!("{}yes{RESET}", stem())
+        } else {
+            format!("{}NO{RESET}", petal())
+        };
+        println!(
+            "  {:>8}  {:>10}  {:>10}  {:>6.2}x  {:>8}  {mark}",
+            budget, raw, b.estimated_tokens, ratio, b.omitted_messages
+        );
+    }
+    println!();
+}
+
+fn synthetic_convo() -> Vec<hos::chat::Message> {
+    let mut v = Vec::new();
+    for i in 0..200 {
+        v.push(hos::chat::Message::new(
+            "user",
+            &format!("Turn {i}: let's work on module {i}. We need to remember the goal, the constraints, and the decisions we made earlier in this long running conversation."),
+        ));
+        v.push(hos::chat::Message::new(
+            "assistant",
+            &format!("Reply {i}: acknowledged. Here is a reasonably detailed response about module {i} that consumes a realistic number of tokens for the benchmark."),
+        ));
+    }
+    v
+}
+
+fn largest_saved_chat() -> Option<String> {
+    let list = crate::chats::list();
+    list["data"]
+        .as_array()?
+        .iter()
+        .max_by_key(|it| it["messages"].as_u64().unwrap_or(0))
+        .and_then(|it| it["id"].as_str().map(String::from))
+}
+
+/// The most recently updated saved chat (chats::list is sorted newest-first).
+fn most_recent_saved_chat() -> Option<String> {
+    let list = crate::chats::list();
+    list["data"].as_array()?.first()?["id"]
+        .as_str()
+        .map(String::from)
 }
 
 fn cmd_serve(o: &Opts) {
@@ -406,8 +1020,10 @@ fn resolve_model(arg: Option<String>) -> PathBuf {
     // never has to paste the 200-char HF snapshot path). Skip this when the name
     // is an explicit file (e.g. `gemma4-12b.hos`) or a path — those should resolve
     // to the file itself, not be redirected to the HF snapshot dir.
-    let looks_like_file =
-        name.ends_with(".hos") || name.ends_with(".flwr") || name.ends_with(".gguf") || name.contains('/');
+    let looks_like_file = name.ends_with(".hos")
+        || name.ends_with(".flwr")
+        || name.ends_with(".gguf")
+        || name.contains('/');
     if !looks_like_file && gemma4_chat::is_gemma4_name(&name) {
         if let Some(p) = gemma4_chat::find_checkpoint() {
             return p;

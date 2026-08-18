@@ -67,6 +67,42 @@ impl Gpu {
     ) {
         unreachable!("{NO_GPU}")
     }
+    // Batched/2-token/small K-quant matmuls used by qwen35's `Weight::matvec_batch`.
+    // Only ever dispatched on a `Weight::Gpu`, which is never built off macOS — the
+    // CPU path uses `cpu_matmat`. Present so the engine type-checks on Windows/Linux.
+    pub fn matmul_q6k_prefill_into(
+        &self,
+        _w: &GpuMatrix,
+        _x: &[f32],
+        _ntok: usize,
+        _out: &mut [f32],
+    ) {
+        unreachable!("{NO_GPU}")
+    }
+    pub fn matmul_q4k_small_into(
+        &self,
+        _w: &GpuMatrix,
+        _x: &[f32],
+        _ntok: usize,
+        _out: &mut [f32],
+    ) {
+        unreachable!("{NO_GPU}")
+    }
+    pub fn matmul_q6k_small_into(
+        &self,
+        _w: &GpuMatrix,
+        _x: &[f32],
+        _ntok: usize,
+        _out: &mut [f32],
+    ) {
+        unreachable!("{NO_GPU}")
+    }
+    pub fn matmul_q4k_2tok_into(&self, _w: &GpuMatrix, _x: &[f32], _out: &mut [f32]) {
+        unreachable!("{NO_GPU}")
+    }
+    pub fn matmul_q6k_2tok_into(&self, _w: &GpuMatrix, _x: &[f32], _out: &mut [f32]) {
+        unreachable!("{NO_GPU}")
+    }
     // keyed GEMM entry points used by tensor.rs autograd (gated behind the GPU
     // residency flag, so unreachable off macOS — present only so the lib builds).
     pub fn matmul_f32_keyed(

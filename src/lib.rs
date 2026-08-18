@@ -49,6 +49,7 @@ pub mod model;
 pub mod nn;
 pub mod peft;
 pub mod qwen35;
+pub mod qwen35_vision;
 pub mod safetensors;
 pub mod tensor;
 pub mod tokenizer;

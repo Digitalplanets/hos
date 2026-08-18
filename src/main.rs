@@ -524,13 +524,17 @@ fn cmd_gemma4_ingest() {
     };
     let dir = std::path::Path::new(&src);
     if !dir.is_dir() {
-        eprintln!("[hos] --gemma4-ingest expects the checkpoint *directory* (config.json + safetensors).");
+        eprintln!(
+            "[hos] --gemma4-ingest expects the checkpoint *directory* (config.json + safetensors)."
+        );
         std::process::exit(1);
     }
-    let out = arg_after("-o").or_else(|| arg_after("--out")).unwrap_or_else(|| {
-        let base = dir.file_name().and_then(|s| s.to_str()).unwrap_or("gemma4");
-        format!("{base}.hos")
-    });
+    let out = arg_after("-o")
+        .or_else(|| arg_after("--out"))
+        .unwrap_or_else(|| {
+            let base = dir.file_name().and_then(|s| s.to_str()).unwrap_or("gemma4");
+            format!("{base}.hos")
+        });
     // Quant is selected by HOS_GEMMA4_QUANT; also honor a `--quantize KIND` flag
     // on this command (q4k/q5k/q6k/hq4) so the CLI matches the other ingest paths.
     // Explicit env wins; then --quantize; else default q4k.
@@ -3212,6 +3216,29 @@ struct Args {
     seed: u64,
     gpu: bool,
     no_echo: bool,
+    chat: bool,
+    system: Option<String>,
+    no_think: bool,
+    effort: Option<String>,
+    hide_thinking: bool,
+    image: Option<String>,
+    mmproj: Option<String>,
+}
+
+impl Args {
+    /// Thinking config for hybrid reasoning models (qwen35). `--no-think` disables
+    /// reasoning; `--effort low|medium|xhigh` sets depth (xhigh default).
+    fn think(&self) -> hos::qwen35::Think {
+        let effort = self
+            .effort
+            .as_deref()
+            .and_then(hos::qwen35::Effort::parse)
+            .unwrap_or(hos::qwen35::Effort::Xhigh);
+        hos::qwen35::Think {
+            on: !self.no_think,
+            effort,
+        }
+    }
 }
 
 /// Resolve a model path so `hos` works from any directory.
@@ -3441,6 +3468,13 @@ fn parse_args() -> Args {
     let mut seed = 42u64;
     let mut gpu = false;
     let mut no_echo = false;
+    let mut chat = false;
+    let mut system: Option<String> = None;
+    let mut no_think = false;
+    let mut effort: Option<String> = None;
+    let mut hide_thinking = false;
+    let mut image: Option<String> = None;
+    let mut mmproj: Option<String> = None;
 
     let mut it = std::env::args().skip(1).peekable();
     while let Some(a) = it.next() {
@@ -3456,10 +3490,21 @@ fn parse_args() -> Args {
             "--seed" => seed = it.next().unwrap().parse().unwrap(),
             "--gpu" => gpu = true,
             "--no-echo" => no_echo = true,
+            "--chat" => chat = true,
+            "--system" => system = Some(it.next().expect("text after --system")),
+            "--no-think" | "--no-thinking" => no_think = true,
+            "--effort" | "--reasoning-effort" => {
+                effort = Some(it.next().expect("level after --effort"))
+            }
+            "--hide-thinking" | "--hide-reasoning" => hide_thinking = true,
+            "--image" | "--img" => image = Some(it.next().expect("path after --image")),
+            "--mmproj" => mmproj = Some(it.next().expect("path after --mmproj")),
+            "--vision-encode" => {} // handled after model load
             "--deltanet-test" => {} // handled at start of main
             "--info" => {}          // handled after model load
             "--gpu-test" => {}      // handled after model load
             "--qwen35-check" => {}  // handled after model load
+            "--vision-check" => {}  // handled after model load
             "--bench" => {}         // handled after model load
             "--finetune"
             | "--finetune-check"
@@ -3477,8 +3522,8 @@ fn parse_args() -> Args {
             // value-taking flags consumed elsewhere (train_lm / gen_hos / to_hos read them)
             "--corpus" | "--out" | "-o" | "--gen-hos" | "--to-hos" | "--hos-viz" | "--ingest"
             | "--verify-against" | "--opt" | "--method" | "--quantize" | "--quant-awq"
-            | "--awq-alpha" | "--genome" | "--remint-ft" | "--base"
-            | "--hos-name" | "--source-note" => {
+            | "--awq-alpha" | "--genome" | "--remint-ft" | "--base" | "--hos-name"
+            | "--source-note" => {
                 let _ = it.next();
             }
             "--perplexity" => {
@@ -3521,6 +3566,13 @@ fn parse_args() -> Args {
         seed,
         gpu,
         no_echo,
+        chat,
+        system,
+        no_think,
+        effort,
+        hide_thinking,
+        image,
+        mmproj,
     }
 }
 
@@ -4429,6 +4481,27 @@ fn main() {
         ok(hos::qwen35::validate(&g));
         return;
     }
+    if std::env::args().any(|a| a == "--vision-check") {
+        ok(hos::qwen35_vision::check(&g));
+        return;
+    }
+    if std::env::args().any(|a| a == "--vision-encode") {
+        let img = args.image.clone().expect("--vision-encode needs --image <path>");
+        let tower = ok(hos::qwen35_vision::VisionTower::load(&g));
+        let t0 = Instant::now();
+        let emb = ok(tower.encode_image(std::path::Path::new(&img)));
+        let pd = tower.cfg.proj_dim;
+        let ntok = emb.len() / pd;
+        let mean = emb.iter().sum::<f32>() / emb.len() as f32;
+        let norm = (emb.iter().map(|v| v * v).sum::<f32>() / emb.len() as f32).sqrt();
+        let finite = emb.iter().all(|v| v.is_finite());
+        eprintln!(
+            "[vision] encoded {img} -> {ntok} tokens x {pd} in {:.1}s | finite={finite} mean={mean:.4} rms={norm:.4}",
+            t0.elapsed().as_secs_f64()
+        );
+        eprintln!("[vision] token0[..8] = {:?}", &emb[..8]);
+        return;
+    }
 
     // Reproducible measurement commands (build their own Engine).
     if std::env::args().any(|a| a == "--bench") {
@@ -4602,8 +4675,50 @@ fn gpu_test(model: &Model) {
 }
 
 /// Experimental CPU path for the qwen35 hybrid (gated delta-net) architecture.
+/// One-shot correctness gate for the resident 2-token verify: compares `forward2`'s
+/// per-token logits against the proven single-token resident `forward` on the same
+/// [t, draft] pair, from the same seeded state. Argmax must match; logits diff tiny.
+#[cfg(target_os = "macos")]
+fn qwen35_fwd2_check(
+    m: &hos::qwen35::Qwen35,
+    r: &hos::qwen35::Qwen35Gpu,
+    state: &mut hos::qwen35::State,
+    logits: &[f32],
+    hidden: &[f32],
+    gpu: Option<&metal_be::Gpu>,
+) {
+    let d = m.dim();
+    let amax = |l: &[f32]| l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) }).0;
+    let p = state.pos;
+    let t = amax(logits) as u32;
+    let draft = amax(&m.mtp_draft_logits(hidden, t, p, state, gpu)) as u32;
+    eprintln!("[fwd2-check] p={p} t={t} draft={draft}");
+    // forward2 (state already seeded to post-prefill p); returns [hid_t | hid_d]
+    let hids = r.forward2(m, t, draft, p);
+    let lt2 = m.logits_from_hidden(&hids[0..d], gpu);
+    let ld2 = m.logits_from_hidden(&hids[d..2 * d], gpu);
+    // reference: reset resident backbone to post-prefill, run proven single-token fwd
+    r.upload_state(m, state, p);
+    let lt = r.forward(m, t, p);
+    let ld = r.forward(m, draft, p + 1);
+    let maxdiff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    eprintln!(
+        "[fwd2-check] token t: argmax fwd2={} ref={} {} | max|dlogit|={:.4}",
+        amax(&lt2), amax(&lt), if amax(&lt2) == amax(&lt) { "OK" } else { "MISMATCH" }, maxdiff(&lt2, &lt),
+    );
+    eprintln!(
+        "[fwd2-check] token d: argmax fwd2={} ref={} {} | max|dlogit|={:.4}",
+        amax(&ld2), amax(&ld), if amax(&ld2) == amax(&ld) { "OK" } else { "MISMATCH" }, maxdiff(&ld2, &ld),
+    );
+}
+
 fn run_qwen35(g: &Gguf, tok: &Tokenizer, args: &Args) {
     use std::io::Write;
+    // Chat mode routes through the shared ChatSession (template + thinking split).
+    if args.chat {
+        run_qwen35_chat(g, args);
+        return;
+    }
     eprintln!("[hos] qwen35 hybrid — EXPERIMENTAL (GPU matmuls + CPU recurrence)");
     let gpu = if args.gpu && cfg!(target_os = "macos") {
         Some(metal_be::Gpu::new())
@@ -4613,14 +4728,128 @@ fn run_qwen35(g: &Gguf, tok: &Tokenizer, args: &Args) {
     let load = Instant::now();
     let m = ok(hos::qwen35::Qwen35::load(g, gpu.as_ref()));
     let mut st = hos::qwen35::State::new(&m);
-    let rgpu = gpu.as_ref().map(|g| hos::qwen35::Qwen35Gpu::new(g, &m));
+    // The fully-resident Metal runner (Qwen35Gpu) predates the corrected forward
+    // (tile head-map, norm-then-gate, MTP-block skip) and its kernels aren't yet
+    // updated, so it is OPT-IN via HOS_QWEN35_RESIDENT. The default path — GPU
+    // matmuls + CPU recurrence — matches ChatSession/serve and is verified correct.
+    let rgpu = if std::env::var("HOS_QWEN35_RESIDENT").is_ok() {
+        gpu.as_ref().map(|g| hos::qwen35::Qwen35Gpu::new(g, &m))
+    } else {
+        None
+    };
     eprintln!("[hos] load took {:.1}s", load.elapsed().as_secs_f64());
 
+    // Raw completion: prompt encoded as-is, stop on eos.
     let ids = tok.encode(&args.prompt, true);
+    let stops: Vec<u32> = tok.eos.into_iter().collect();
     eprintln!("[hos] prompt -> {} tokens", ids.len());
     if !args.no_echo {
         print!("{}", args.prompt);
         std::io::stdout().flush().ok();
+    }
+
+    // MTP self-speculative decode (opt-in for A/B): batched 2-token verify.
+    if m.has_mtp() && std::env::var("HOS_QWEN35_MTP").is_ok() {
+        use std::io::Write;
+        let mut state = hos::qwen35::State::new(&m);
+        let t0 = Instant::now();
+        let (logits, hidden) = m.forward_prefill_mtp(&mut state, &ids, gpu.as_ref());
+        let pfs = t0.elapsed().as_secs_f64();
+        // Resident 2-token verify (GPU): seed the resident backbone from the prefill
+        // state, then verify on-GPU. Opt-in via HOS_QWEN35_MTP_GPU; falls back to the
+        // CPU-recurrence verify when off or when no GPU is present.
+        #[cfg(target_os = "macos")]
+        let rgpu2 = if std::env::var("HOS_QWEN35_MTP_GPU").is_ok() {
+            gpu.as_ref().map(|g| {
+                let r = hos::qwen35::Qwen35Gpu::new(g, &m);
+                r.upload_state(&m, &state, state.pos);
+                r
+            })
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        if std::env::var("HOS_QWEN35_FWD2_TEST").is_ok() {
+            if let Some(r) = rgpu2.as_ref() {
+                qwen35_fwd2_check(&m, r, &mut state, &logits, &hidden, gpu.as_ref());
+                return;
+            }
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let gen = Instant::now();
+        #[cfg(target_os = "macos")]
+        let n = if let Some(r) = rgpu2.as_ref() {
+            m.decode_speculative_resident(
+                &mut state, r, logits, hidden, args.n_predict, args.temp, args.top_k, args.top_p,
+                args.rep_penalty, args.repeat_last_n, args.seed, &stops, gpu.as_ref(),
+                |tk| {
+                    buf.clear();
+                    tok.decode_into(tk, &mut buf);
+                    pending.extend_from_slice(&buf);
+                    let valid = match std::str::from_utf8(&pending) {
+                        Ok(s) => s.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if valid > 0 {
+                        print!("{}", std::str::from_utf8(&pending[..valid]).unwrap());
+                        std::io::stdout().flush().ok();
+                        pending.drain(..valid);
+                    }
+                    false
+                },
+            )
+        } else {
+            m.decode_speculative(
+                &mut state, logits, hidden, args.n_predict, args.temp, args.top_k, args.top_p,
+                args.rep_penalty, args.repeat_last_n, args.seed, &stops, gpu.as_ref(),
+                |tk| {
+                    buf.clear();
+                    tok.decode_into(tk, &mut buf);
+                    pending.extend_from_slice(&buf);
+                    let valid = match std::str::from_utf8(&pending) {
+                        Ok(s) => s.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if valid > 0 {
+                        print!("{}", std::str::from_utf8(&pending[..valid]).unwrap());
+                        std::io::stdout().flush().ok();
+                        pending.drain(..valid);
+                    }
+                    false
+                },
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let n = m.decode_speculative(
+            &mut state, logits, hidden, args.n_predict, args.temp, args.top_k, args.top_p,
+            args.rep_penalty, args.repeat_last_n, args.seed, &stops, gpu.as_ref(),
+            |tk| {
+                buf.clear();
+                tok.decode_into(tk, &mut buf);
+                pending.extend_from_slice(&buf);
+                let valid = match std::str::from_utf8(&pending) {
+                    Ok(s) => s.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if valid > 0 {
+                    print!("{}", std::str::from_utf8(&pending[..valid]).unwrap());
+                    std::io::stdout().flush().ok();
+                    pending.drain(..valid);
+                }
+                false
+            },
+        );
+        if !pending.is_empty() {
+            print!("{}", String::from_utf8_lossy(&pending));
+        }
+        println!();
+        let ds = gen.elapsed().as_secs_f64();
+        eprintln!(
+            "[hos] MTP decode: {} tok in {:.1}s ({:.2} tok/s) | prefill {:.2}s",
+            n, ds, n as f64 / ds.max(1e-9), pfs
+        );
+        return;
     }
 
     let mut pos = 0usize;
@@ -4636,6 +4865,9 @@ fn run_qwen35(g: &Gguf, tok: &Tokenizer, args: &Args) {
     let mut rng = args.seed;
     let mut recent: Vec<u32> = Vec::new();
     let mut buf = Vec::new();
+    // Byte accumulator so a multi-byte UTF-8 char that spans two tokens (e.g. ÷,
+    // →, emoji) is emitted whole rather than as replacement glyphs.
+    let mut pending_bytes: Vec<u8> = Vec::new();
     let mut n = 0usize;
     let gen = Instant::now();
     for _ in 0..args.n_predict {
@@ -4650,13 +4882,22 @@ fn run_qwen35(g: &Gguf, tok: &Tokenizer, args: &Args) {
             &mut rng,
         );
         recent.push(next);
-        if Some(next) == tok.eos || pos >= 4000 {
+        if stops.contains(&next) || pos >= 4000 {
             break;
         }
         buf.clear();
         tok.decode_into(next, &mut buf);
-        print!("{}", String::from_utf8_lossy(&buf));
-        std::io::stdout().flush().ok();
+        pending_bytes.extend_from_slice(&buf);
+        // Emit only the complete-UTF-8 prefix; keep any partial trailing char.
+        let valid = match std::str::from_utf8(&pending_bytes) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid > 0 {
+            print!("{}", std::str::from_utf8(&pending_bytes[..valid]).unwrap());
+            std::io::stdout().flush().ok();
+            pending_bytes.drain(..valid);
+        }
         logits = match &rgpu {
             Some(r) => r.forward(&m, next, pos),
             None => m.forward(&mut st, next, pos, gpu.as_ref()),
@@ -4664,14 +4905,116 @@ fn run_qwen35(g: &Gguf, tok: &Tokenizer, args: &Args) {
         pos += 1;
         n += 1;
     }
-    let _ = dec;
+    // Flush any incomplete trailing char (best-effort) at end of stream.
+    if !pending_bytes.is_empty() {
+        print!("{}", String::from_utf8_lossy(&pending_bytes));
+    }
+    let prefill_secs = gen.duration_since(dec).as_secs_f64();
+    let decode_secs = gen.elapsed().as_secs_f64();
+    let dtps = n as f64 / decode_secs.max(1e-9);
     println!();
     eprintln!(
         "[hos] decode: {} tok in {:.1}s ({:.2} tok/s)",
-        n,
-        gen.elapsed().as_secs_f64(),
-        n as f64 / gen.elapsed().as_secs_f64().max(1e-9)
+        n, decode_secs, dtps
     );
+    // Profiler: prefill split + effective decode bandwidth (weights re-read per
+    // token), so kernel work is measured against the hardware ceiling, not vibes.
+    if std::env::var("HOS_QWEN35_PROF").is_ok() {
+        let mbytes = args
+            .model
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() as f64)
+            .unwrap_or(0.0);
+        let gbps = (mbytes / 1e9) * dtps;
+        eprintln!(
+            "[prof] prefill {} tok in {:.2}s ({:.1} tok/s) | decode {:.2} tok/s | ~{:.0} GB/s effective (model {:.1} GB)",
+            ids.len(),
+            prefill_secs,
+            ids.len() as f64 / prefill_secs.max(1e-9),
+            dtps,
+            gbps,
+            mbytes / 1e9,
+        );
+    }
+}
+
+/// `hos --chat` for qwen35: full chat template + thinking mode via `ChatSession`.
+/// Reasoning streams dimmed (unless `--hide-thinking`); the answer streams normal.
+fn run_qwen35_chat(g: &Gguf, args: &Args) {
+    use hos::qwen35::Chunk;
+    use std::io::Write;
+    let tok = ok(hos::tokenizer::Tokenizer::from_gguf(g));
+    let mut sess = ok(hos::qwen35::ChatSession::load(g, tok, args.gpu));
+    let think = args.think();
+    let mut msgs = Vec::new();
+    if let Some(s) = &args.system {
+        msgs.push(hos::chat::Message::new("system", s));
+    }
+    msgs.push(hos::chat::Message::new("user", &args.prompt));
+
+    // Vision: if --image + --mmproj given, encode the image and splice it in.
+    let img_emb: Option<Vec<f32>> = match (&args.image, &args.mmproj) {
+        (Some(img), Some(mm)) => {
+            eprintln!("[hos] loading vision tower {mm}");
+            let mg = ok(hos::gguf::Gguf::open(std::path::Path::new(mm)));
+            let tower = ok(hos::qwen35_vision::VisionTower::load(&mg));
+            eprintln!("[hos] encoding image {img} ...");
+            let t0 = Instant::now();
+            let e = ok(tower.encode_image_cached(std::path::Path::new(img)));
+            eprintln!(
+                "[hos] image -> {} tokens ({:.1}s)",
+                e.len() / tower.cfg.proj_dim,
+                t0.elapsed().as_secs_f64()
+            );
+            Some(e)
+        }
+        (Some(_), None) => {
+            eprintln!("[hos] --image needs --mmproj <mmproj.gguf>; ignoring image");
+            None
+        }
+        _ => None,
+    };
+
+    let hide = args.hide_thinking;
+    let mut in_reason = false;
+    sess.chat_img(
+        &msgs,
+        img_emb.as_deref(),
+        think,
+        args.n_predict,
+        args.temp,
+        args.top_k,
+        args.top_p,
+        args.rep_penalty,
+        args.repeat_last_n,
+        args.seed,
+        |chunk| {
+            match chunk {
+                Chunk::Reasoning(t) => {
+                    if !hide {
+                        if !in_reason {
+                            print!("{}", hos::viz::faint());
+                            in_reason = true;
+                        }
+                        print!("{t}");
+                    }
+                }
+                Chunk::Answer(t) => {
+                    if in_reason {
+                        print!("{}\n\n", hos::viz::RESET);
+                        in_reason = false;
+                    }
+                    print!("{t}");
+                }
+            }
+            std::io::stdout().flush().ok();
+        },
+    );
+    if in_reason {
+        print!("{}", hos::viz::RESET);
+    }
+    println!();
 }
 
 /// TRAIN FROM SPEC: a multi-head transformer with a MoE FFN, defined ENTIRELY in
@@ -6097,9 +6440,8 @@ fn print_banner() {
 /// M4: verify the spec-driven Llama runner matches the hand-coded forward.
 fn interp_check() {
     use std::collections::HashMap;
-    let mp = arg_after("--interp-check").unwrap_or_else(|| {
-        "path/to/SmolLM2-135M-Instruct-Q8_0.gguf".into()
-    });
+    let mp = arg_after("--interp-check")
+        .unwrap_or_else(|| "path/to/SmolLM2-135M-Instruct-Q8_0.gguf".into());
     let g = ok(Gguf::open(std::path::Path::new(&mp)));
     let tok = ok(Tokenizer::from_gguf(&g));
     let model = ok(Model::load(&g, None)); // CPU

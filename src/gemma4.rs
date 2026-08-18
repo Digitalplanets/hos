@@ -1008,7 +1008,9 @@ impl Gemma4 {
                     ggml_type,
                     rows,
                     cols,
-                } if *ggml_type == crate::model::HQ4_TYPE || *ggml_type == crate::model::E8_TYPE => {
+                } if *ggml_type == crate::model::HQ4_TYPE
+                    || *ggml_type == crate::model::E8_TYPE =>
+                {
                     Weight::Quant {
                         bytes: bytes.clone(),
                         ggml_type: *ggml_type,
@@ -1053,7 +1055,12 @@ impl Gemma4 {
                 cols,
             } if ggml_type == crate::model::HQ4_TYPE || ggml_type == crate::model::E8_TYPE => {
                 // No Metal kernel for the native quants — keep the lm-head on CPU.
-                self.embed = Weight::Quant { bytes, ggml_type, rows, cols };
+                self.embed = Weight::Quant {
+                    bytes,
+                    ggml_type,
+                    rows,
+                    cols,
+                };
             }
             Weight::Quant {
                 bytes,
@@ -1260,9 +1267,237 @@ impl Gemma4 {
         rvec(h, bf); // *= layer_scalar -> bf16
     }
 
+    /// One decoder layer over the WHOLE prompt at once, writing each token's
+    /// processed k/v into `cache`. Same per-op math + bf16 rounding as `layer_step`,
+    /// but the seven big projections (wq/wk/wv/wo/gate/up/down) go through
+    /// `cpu_matmat`, which dequantizes each weight row ONCE and dots it against all
+    /// `seq` tokens — so a P-token prompt reads each weight once instead of P times.
+    /// Bit-identical to looping `layer_step` (same dequant + `dot_f32` + rounding).
+    /// CPU only (`matvec`/`cpu_matmat`, no `gpu`); the GPU prefill is separate.
+    fn layer_prefill_cpu(&self, l: usize, cache: &mut Gemma4Cache, h: &mut [Vec<f32>], start: usize) {
+        let lw = &self.layers[l];
+        let hidden = self.cfg.hidden;
+        let eps = self.cfg.rms_eps;
+        let hd = lw.head_dim();
+        let n_kv = lw.n_kv();
+        let nh = self.cfg.n_heads;
+        let n_rep = nh / n_kv;
+        let inv_freq: &[f32] = if lw.global {
+            &self.inv_freq_global
+        } else {
+            &self.inv_freq_local
+        };
+        let bf = self.bf16_emul;
+        let seq = h.len();
+
+        // input_layernorm -> bf16, stacked as A[seq, hidden]
+        let mut a_all = vec![0.0f32; seq * hidden];
+        for t in 0..seq {
+            let mut a = rmsnorm_raw(&h[t], &lw.input_ln, eps);
+            rvec(&mut a, bf);
+            a_all[t * hidden..(t + 1) * hidden].copy_from_slice(&a);
+        }
+
+        // batched projections (each weight row dequantized once, dotted over all t)
+        let mut q = vec![0.0f32; seq * nh * hd];
+        crate::model::cpu_matmat(&mut q, &lw.wq, &a_all, seq);
+        let mut k = vec![0.0f32; seq * n_kv * hd];
+        crate::model::cpu_matmat(&mut k, &lw.wk, &a_all, seq);
+        // q_proj/k_proj -> bf16, then per-head q/k-norm BEFORE rope
+        for t in 0..seq {
+            let qslot = &mut q[t * nh * hd..(t + 1) * nh * hd];
+            rvec(qslot, bf);
+            for hh in 0..nh {
+                let head = &mut qslot[hh * hd..(hh + 1) * hd];
+                rmsnorm_raw_inplace(head, &lw.q_norm, eps);
+                rvec(head, bf);
+                rope_head(head, inv_freq, start + t, bf);
+            }
+            let kslot = &mut k[t * n_kv * hd..(t + 1) * n_kv * hd];
+            rvec(kslot, bf);
+        }
+        // v source: global => v = k_src (k_eq_v, taken AFTER k's bf16 round, BEFORE
+        // k-norm/rope); sliding => v_proj(a). Then k-norm+rope on k, v-norm on v.
+        let mut v = vec![0.0f32; seq * n_kv * hd];
+        if lw.global {
+            v.copy_from_slice(&k);
+        } else {
+            crate::model::cpu_matmat(&mut v, lw.wv.as_ref().unwrap(), &a_all, seq);
+            for t in 0..seq {
+                rvec(&mut v[t * n_kv * hd..(t + 1) * n_kv * hd], bf);
+            }
+        }
+        for t in 0..seq {
+            let kslot = &mut k[t * n_kv * hd..(t + 1) * n_kv * hd];
+            for hh in 0..n_kv {
+                let head = &mut kslot[hh * hd..(hh + 1) * hd];
+                rmsnorm_raw_inplace(head, &lw.k_norm, eps);
+                rvec(head, bf);
+                rope_head(head, inv_freq, start + t, bf);
+            }
+            let vslot = &mut v[t * n_kv * hd..(t + 1) * n_kv * hd];
+            for hh in 0..n_kv {
+                let head = &mut vslot[hh * hd..(hh + 1) * hd];
+                rmsnorm_noscale(head, eps);
+                rvec(head, bf);
+            }
+        }
+        // append this whole prompt's processed k/v to the cache (positions start..start+seq)
+        cache.k[l].extend_from_slice(&k);
+        cache.v[l].extend_from_slice(&v);
+
+        // attention (scaling = 1.0) then o_proj (batched) + post_attn_ln + residual
+        let o_in = nh * hd;
+        let mut merged_all = vec![0.0f32; seq * o_in];
+        for t in 0..seq {
+            let abs = start + t;
+            let lo = if lw.global {
+                0
+            } else {
+                (abs + 1).saturating_sub(self.cfg.sliding_window)
+            };
+            let merged = &mut merged_all[t * o_in..(t + 1) * o_in];
+            for hh in 0..nh {
+                let kvh = hh / n_rep;
+                let qh = &q[t * nh * hd + hh * hd..t * nh * hd + hh * hd + hd];
+                let mut scores = vec![0.0f32; abs - lo + 1];
+                for (idx, j) in (lo..=abs).enumerate() {
+                    let kh = &k[j * n_kv * hd + kvh * hd..j * n_kv * hd + kvh * hd + hd];
+                    let mut s = 0.0f32;
+                    for d in 0..hd {
+                        s += qh[d] * kh[d];
+                    }
+                    scores[idx] = s;
+                }
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in scores.iter_mut() {
+                    *s /= sum;
+                    if bf {
+                        *s = bf16(*s);
+                    }
+                }
+                let out = &mut merged[hh * hd..(hh + 1) * hd];
+                for (idx, j) in (lo..=abs).enumerate() {
+                    let vh = &v[j * n_kv * hd + kvh * hd..j * n_kv * hd + kvh * hd + hd];
+                    let w = scores[idx];
+                    for d in 0..hd {
+                        out[d] += w * vh[d];
+                    }
+                }
+            }
+            rvec(merged, bf); // attn_output -> bf16
+        }
+        let mut attn_all = vec![0.0f32; seq * hidden];
+        crate::model::cpu_matmat(&mut attn_all, &lw.wo, &merged_all, seq);
+        for t in 0..seq {
+            let attn = &mut attn_all[t * hidden..(t + 1) * hidden];
+            rvec(attn, bf); // o_proj -> bf16
+            let mut post = rmsnorm_raw(attn, &lw.post_attn_ln, eps);
+            rvec(&mut post, bf);
+            for i in 0..hidden {
+                h[t][i] += post[i];
+            }
+            rvec(&mut h[t], bf); // residual add -> bf16
+        }
+
+        // MLP: pre_ff_ln -> gate/up (batched) -> gelu*up -> down (batched) -> post_ff_ln
+        let mut pf_all = vec![0.0f32; seq * hidden];
+        for t in 0..seq {
+            let mut pf = rmsnorm_raw(&h[t], &lw.pre_ff_ln, eps);
+            rvec(&mut pf, bf);
+            pf_all[t * hidden..(t + 1) * hidden].copy_from_slice(&pf);
+        }
+        let inter = self.cfg.inter;
+        let mut g_all = vec![0.0f32; seq * inter];
+        crate::model::cpu_matmat(&mut g_all, &lw.gate, &pf_all, seq);
+        let mut u_all = vec![0.0f32; seq * inter];
+        crate::model::cpu_matmat(&mut u_all, &lw.up, &pf_all, seq);
+        for t in 0..seq {
+            let g = &mut g_all[t * inter..(t + 1) * inter];
+            let u = &u_all[t * inter..(t + 1) * inter];
+            rvec(g, bf); // gate_proj -> bf16
+            // NOTE: up is rounded in place below on its own slice
+            let _ = u;
+        }
+        for t in 0..seq {
+            rvec(&mut u_all[t * inter..(t + 1) * inter], bf); // up_proj -> bf16
+        }
+        for t in 0..seq {
+            let g = &mut g_all[t * inter..(t + 1) * inter];
+            let u = &u_all[t * inter..(t + 1) * inter];
+            for i in 0..inter {
+                let gi = if bf { bf16(gelu_tanh(g[i])) } else { gelu_tanh(g[i]) };
+                g[i] = gi * u[i];
+                if bf {
+                    g[i] = bf16(g[i]);
+                }
+            }
+        }
+        let mut m_all = vec![0.0f32; seq * hidden];
+        crate::model::cpu_matmat(&mut m_all, &lw.down, &g_all, seq);
+        for t in 0..seq {
+            let m = &mut m_all[t * hidden..(t + 1) * hidden];
+            rvec(m, bf); // down_proj -> bf16
+            let mut post = rmsnorm_raw(m, &lw.post_ff_ln, eps);
+            rvec(&mut post, bf);
+            for i in 0..hidden {
+                h[t][i] += post[i];
+            }
+            rvec(&mut h[t], bf); // residual add -> bf16
+            let ls = if bf { bf16(lw.layer_scalar) } else { lw.layer_scalar };
+            for i in 0..hidden {
+                h[t][i] *= ls;
+            }
+            rvec(&mut h[t], bf); // *= layer_scalar -> bf16
+        }
+    }
+
+    /// Batched CPU prefill: process the whole prompt in one pass per layer (each
+    /// weight read once) and return the last-position post-softcap logits. Produces
+    /// byte-identical logits to the per-token `prefill`, at a fraction of the weight
+    /// bandwidth on x86/Windows. Starts from a fresh cache (position 0).
+    fn prefill_cpu_batched(&self, cache: &mut Gemma4Cache, ids: &[u32]) -> Vec<f32> {
+        let bf = self.bf16_emul;
+        let start = cache.len;
+        // embed * bf16(sqrt(hidden)) for every token
+        let mut h: Vec<Vec<f32>> = ids.iter().map(|&id| self.text_embed(id)).collect();
+        for l in 0..self.layers.len() {
+            self.layer_prefill_cpu(l, cache, &mut h, start);
+        }
+        cache.len = start + ids.len();
+        // final norm + tied lm-head + softcap on the last position
+        let last = &h[h.len() - 1];
+        let mut hn = rmsnorm_raw(last, &self.final_norm, self.cfg.rms_eps);
+        rvec(&mut hn, bf);
+        let mut logits = matvec_g(&self.embed, &hn, self.cfg.vocab, None);
+        rvec(&mut logits, bf);
+        let cap = self.cfg.final_softcap;
+        for vv in logits.iter_mut() {
+            *vv = cap * (*vv / cap).tanh();
+            if bf {
+                *vv = bf16(*vv);
+            }
+        }
+        logits
+    }
+
     /// Prefill: process the whole prompt through the cache, returning the
-    /// last-position post-softcap logits (== `forward(ids).logits`).
+    /// last-position post-softcap logits (== `forward(ids).logits`). On CPU with a
+    /// multi-token prompt this uses the batched (weight-read-once) path; the GPU
+    /// path and tiny prompts fall back to the per-token loop.
     pub fn prefill(&self, cache: &mut Gemma4Cache, ids: &[u32], gpu: Option<&Gpu>) -> Vec<f32> {
+        if gpu.is_none()
+            && ids.len() >= 8
+            && cache.len == 0
+            && std::env::var("HOS_GEMMA4_NOBATCH").is_err()
+        {
+            return self.prefill_cpu_batched(cache, ids);
+        }
         let mut logits = Vec::new();
         for &id in ids {
             logits = self.decode_step(cache, id, gpu);
@@ -2046,7 +2281,12 @@ fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
 fn weight_to_raw(name: String, role: u8, w: &Weight) -> crate::format::RawTensor {
     use crate::format::{ggml_to_dtype, RawTensor, DTYPE_E8, DTYPE_F32, DTYPE_HQ4};
     match w {
-        Weight::Quant { bytes, ggml_type, rows, cols } => RawTensor {
+        Weight::Quant {
+            bytes,
+            ggml_type,
+            rows,
+            cols,
+        } => RawTensor {
             name,
             role,
             shape: vec![*rows, *cols],
@@ -2085,13 +2325,32 @@ fn vec_to_raw(name: String, role: u8, v: &[f32]) -> crate::format::RawTensor {
 
 fn raw_to_weight(r: crate::format::RawTensor, cols: usize) -> crate::Result<Weight> {
     use crate::format::{decode_raw, dtype_to_ggml, DTYPE_E8, DTYPE_F32, DTYPE_HQ4};
-    let rows = if cols == 0 { r.nfloats } else { r.nfloats / cols };
+    let rows = if cols == 0 {
+        r.nfloats
+    } else {
+        r.nfloats / cols
+    };
     if r.dtype == DTYPE_HQ4 {
-        Ok(Weight::Quant { bytes: r.bytes, ggml_type: crate::model::HQ4_TYPE, rows, cols })
+        Ok(Weight::Quant {
+            bytes: r.bytes,
+            ggml_type: crate::model::HQ4_TYPE,
+            rows,
+            cols,
+        })
     } else if r.dtype == DTYPE_E8 {
-        Ok(Weight::Quant { bytes: r.bytes, ggml_type: crate::model::E8_TYPE, rows, cols })
+        Ok(Weight::Quant {
+            bytes: r.bytes,
+            ggml_type: crate::model::E8_TYPE,
+            rows,
+            cols,
+        })
     } else if let Some(gt) = dtype_to_ggml(r.dtype) {
-        Ok(Weight::Quant { bytes: r.bytes, ggml_type: gt, rows, cols })
+        Ok(Weight::Quant {
+            bytes: r.bytes,
+            ggml_type: gt,
+            rows,
+            cols,
+        })
     } else if r.dtype == DTYPE_F32 {
         Ok(Weight::cpu(
             r.bytes
@@ -2136,15 +2395,39 @@ impl Gemma4 {
             raws.push(weight_to_raw(format!("l{l}.gate"), ROLE_WEIGHT, &lw.gate));
             raws.push(weight_to_raw(format!("l{l}.up"), ROLE_WEIGHT, &lw.up));
             raws.push(weight_to_raw(format!("l{l}.down"), ROLE_WEIGHT, &lw.down));
-            raws.push(vec_to_raw(format!("l{l}.input_ln"), ROLE_NORM, &lw.input_ln));
-            raws.push(vec_to_raw(format!("l{l}.post_attn_ln"), ROLE_NORM, &lw.post_attn_ln));
-            raws.push(vec_to_raw(format!("l{l}.pre_ff_ln"), ROLE_NORM, &lw.pre_ff_ln));
-            raws.push(vec_to_raw(format!("l{l}.post_ff_ln"), ROLE_NORM, &lw.post_ff_ln));
+            raws.push(vec_to_raw(
+                format!("l{l}.input_ln"),
+                ROLE_NORM,
+                &lw.input_ln,
+            ));
+            raws.push(vec_to_raw(
+                format!("l{l}.post_attn_ln"),
+                ROLE_NORM,
+                &lw.post_attn_ln,
+            ));
+            raws.push(vec_to_raw(
+                format!("l{l}.pre_ff_ln"),
+                ROLE_NORM,
+                &lw.pre_ff_ln,
+            ));
+            raws.push(vec_to_raw(
+                format!("l{l}.post_ff_ln"),
+                ROLE_NORM,
+                &lw.post_ff_ln,
+            ));
             raws.push(vec_to_raw(format!("l{l}.q_norm"), ROLE_NORM, &lw.q_norm));
             raws.push(vec_to_raw(format!("l{l}.k_norm"), ROLE_NORM, &lw.k_norm));
-            raws.push(vec_to_raw(format!("l{l}.layer_scalar"), ROLE_SCALAR, &[lw.layer_scalar]));
+            raws.push(vec_to_raw(
+                format!("l{l}.layer_scalar"),
+                ROLE_SCALAR,
+                &[lw.layer_scalar],
+            ));
         }
-        raws.push(vec_to_raw("final_norm".to_string(), ROLE_NORM, &self.final_norm));
+        raws.push(vec_to_raw(
+            "final_norm".to_string(),
+            ROLE_NORM,
+            &self.final_norm,
+        ));
 
         let arch = serde_json::json!({
             "architecture": "gemma4",
@@ -2193,7 +2476,10 @@ impl Gemma4 {
             let hd = if g { HEAD_DIM_GLOBAL } else { HEAD_DIM_SLIDING };
             let o_in = cfg.n_heads * hd;
             let wv = if map.contains_key(&format!("l{l}.wv")) {
-                Some(raw_to_weight(take(&mut map, &format!("l{l}.wv"))?, cfg.hidden)?)
+                Some(raw_to_weight(
+                    take(&mut map, &format!("l{l}.wv"))?,
+                    cfg.hidden,
+                )?)
             } else {
                 None
             };

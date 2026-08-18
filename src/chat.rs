@@ -12,6 +12,7 @@ use crate::model::Arch;
 use crate::tokenizer::Tokenizer;
 
 /// A single conversation turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: String,
     pub content: String,
@@ -128,15 +129,43 @@ pub fn build_ids(
         }
         ChatFamily::Gemma => {
             sp(&mut ids, tok, "<bos>");
+            // Gemma has no system role and requires strict user/model
+            // alternation, so fold system content (including the injected memory
+            // block) into the next user turn instead of emitting a separate turn.
+            let mut sys = String::new();
             for m in msgs {
-                // Gemma has no system role and calls the assistant "model".
-                let role = match m.role.as_str() {
-                    "assistant" => "model",
-                    "system" => "user",
-                    r => r,
-                };
+                match m.role.as_str() {
+                    "system" => {
+                        if !sys.is_empty() {
+                            sys.push_str("\n\n");
+                        }
+                        sys.push_str(&m.content);
+                    }
+                    "assistant" => {
+                        sp(&mut ids, tok, "<start_of_turn>");
+                        tx(&mut ids, tok, &format!("model\n{}", m.content));
+                        sp(&mut ids, tok, "<end_of_turn>");
+                        tx(&mut ids, tok, "\n");
+                    }
+                    _ => {
+                        let body = if sys.is_empty() {
+                            m.content.clone()
+                        } else {
+                            let s = format!("{}\n\n{}", sys, m.content);
+                            sys.clear();
+                            s
+                        };
+                        sp(&mut ids, tok, "<start_of_turn>");
+                        tx(&mut ids, tok, &format!("user\n{}", body));
+                        sp(&mut ids, tok, "<end_of_turn>");
+                        tx(&mut ids, tok, "\n");
+                    }
+                }
+            }
+            // Trailing system content with no following user turn: its own turn.
+            if !sys.is_empty() {
                 sp(&mut ids, tok, "<start_of_turn>");
-                tx(&mut ids, tok, &format!("{}\n{}", role, m.content));
+                tx(&mut ids, tok, &format!("user\n{}", sys));
                 sp(&mut ids, tok, "<end_of_turn>");
                 tx(&mut ids, tok, "\n");
             }
