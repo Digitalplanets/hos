@@ -225,11 +225,21 @@ fn cmd_run(o: &Opts) {
             return;
         }
     }
-    let name = model_name_of(&path);
+    let mut name = model_name_of(&path);
     let mut eng = load(&path, o.gpu);
     let backend = if o.gpu { "metal gpu" } else { "cpu" };
+    // Live-editable sampling knobs (via /param), seeded from the CLI flags.
+    let mut smp = Sampling {
+        temp: o.temp,
+        top_k: o.top_k,
+        top_p: o.top_p,
+        rep_penalty: o.rep_penalty,
+        repeat_last_n: o.repeat_last_n,
+        n_predict: o.n_predict,
+        seed: o.seed,
+    };
 
-    let turn = |eng: &mut hos::Engine, history: &[hos::chat::Message]| -> String {
+    let turn = |eng: &mut hos::Engine, history: &[hos::chat::Message], s: &Sampling| -> String {
         print!(
             "  {}{}flwr{}  ",
             hos::viz::BOLD,
@@ -240,13 +250,13 @@ fn cmd_run(o: &Opts) {
         let mut reply = String::new();
         eng.chat(
             history,
-            o.n_predict,
-            o.temp,
-            o.top_k,
-            o.top_p,
-            o.rep_penalty,
-            o.repeat_last_n,
-            o.seed,
+            s.n_predict,
+            s.temp,
+            s.top_k,
+            s.top_p,
+            s.rep_penalty,
+            s.repeat_last_n,
+            s.seed,
             |piece| {
                 print!("{piece}");
                 std::io::stdout().flush().ok();
@@ -262,20 +272,16 @@ fn cmd_run(o: &Opts) {
     if let Some(p) = &o.prompt {
         print!("{}", hos::viz::banner());
         let history = vec![hos::chat::Message::new("user", p)];
-        turn(&mut eng, &history);
+        turn(&mut eng, &history, &smp);
         return;
     }
 
     organism_banner(&eng, &name, backend);
-    println!(
-        "    {}/role <text> · /continue · /list · /open <id> · /new · /bye{}",
-        hos::viz::faint(),
-        hos::viz::RESET
-    );
+    println!("{}", cmd_hint(true));
     let mut history: Vec<hos::chat::Message> = Vec::new();
     let mut last_memory_sig = String::new();
     let mut chat_id = crate::chats::new_id();
-    let model_meta = serde_json::json!({ "name": name.clone() });
+    let mut model_meta = serde_json::json!({ "name": name.clone() });
     let params_meta = serde_json::json!({
         "temp": o.temp, "top_k": o.top_k, "top_p": o.top_p,
         "n_predict": o.n_predict, "seed": o.seed, "gpu": o.gpu,
@@ -309,13 +315,116 @@ fn cmd_run(o: &Opts) {
             continue;
         }
         if matches!(text, "/list" | "/chats") {
-            print_chat_list();
+            let list = crate::chats::list();
+            let items = list["data"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                println!("    · no saved conversations yet.\n");
+                continue;
+            }
+            let labels: Vec<String> = items
+                .iter()
+                .map(|it| {
+                    let title = it["title"].as_str().unwrap_or("untitled");
+                    let n = it["messages"].as_u64().unwrap_or(0);
+                    format!("{title}   ({n} msgs)")
+                })
+                .collect();
+            match select_menu("open conversation", &labels, "↑/↓ move · enter open · q cancel") {
+                Some(i) => {
+                    if let Some(id) = items[i]["id"].as_str() {
+                        if let Some(msgs) = load_chat_history(id) {
+                            history = msgs;
+                            chat_id = id.to_string();
+                            replay_history(&history);
+                        } else {
+                            println!("    · could not open that conversation.\n");
+                        }
+                    }
+                }
+                None => print_chat_list(), // not a TTY (piped) or cancelled -> plain list
+            }
+            continue;
+        }
+        if matches!(text, "/models" | "/model") {
+            let models = switchable_models();
+            if models.is_empty() {
+                println!("    · no models found in the model directories.\n");
+                continue;
+            }
+            let labels: Vec<String> = models
+                .iter()
+                .map(|m| if m == &name { format!("{m}   (current)") } else { m.clone() })
+                .collect();
+            let Some(i) = select_menu("switch model", &labels, "↑/↓ move · enter load · q cancel")
+            else {
+                continue;
+            };
+            let pick = models[i].clone();
+            if pick == name {
+                println!("    · already on {pick}.\n");
+                continue;
+            }
+            let Some(newpath) = resolve_model_opt(&pick) else {
+                println!("    · could not find '{pick}'.\n");
+                continue;
+            };
+            // Gemma-4 and qwen35 hybrid run on their own REPL backends; a live
+            // in-place swap would need the Engine to become them. Instead hand off
+            // to a fresh REPL with the right backend by re-exec'ing flwr — a clean
+            // switch to any family. Reset the terminal first: exec replaces this
+            // process, so the Meter's Drop won't run.
+            let is_gemma = gemma4_chat::is_gemma4(&newpath) || gemma4_chat::is_gemma4_capsule(&newpath);
+            let is_qwen35 = !is_gemma
+                && hos::gguf::Gguf::open(&newpath)
+                    .map(|g| hos::model::Arch::detect(&g) == hos::model::Arch::Qwen35Hybrid)
+                    .unwrap_or(false);
+            if is_gemma || is_qwen35 {
+                print!("\x1b[r\x1b[2J\x1b[H\x1b[?25h");
+                std::io::stdout().flush().ok();
+                let exe =
+                    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("flwr"));
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg("run").arg(&pick);
+                if !o.gpu {
+                    cmd.arg("--cpu");
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let err = cmd.exec(); // replaces this process on success
+                    eprintln!("    · could not switch to {pick}: {err}");
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = cmd.status();
+                    std::process::exit(0);
+                }
+                continue;
+            }
+            print!("    · loading {}{pick}{} …", hos::viz::petal(), hos::viz::RESET);
+            std::io::stdout().flush().ok();
+            match hos::Engine::load(&newpath, o.gpu) {
+                Ok(e) => {
+                    eng = e;
+                    name = model_name_of(&newpath);
+                    model_meta = serde_json::json!({ "name": name.clone() });
+                    history.clear();
+                    chat_id = crate::chats::new_id();
+                    println!(
+                        "\r    · now running {}{}{}. fresh conversation.        \n",
+                        hos::viz::petal(),
+                        name,
+                        hos::viz::RESET
+                    );
+                }
+                Err(e) => println!("\r    · could not load {pick}: {e}          \n"),
+            }
             continue;
         }
         if let Some(rest) = text.strip_prefix("/open") {
             let id = rest.trim();
             if id.is_empty() {
-                println!("    · usage: /open <id>   (see /list)\n");
+                println!("    · usage: /open <id>   (or just /list to pick)\n");
             } else if let Some(msgs) = load_chat_history(id) {
                 history = msgs;
                 chat_id = id.to_string();
@@ -363,9 +472,10 @@ fn cmd_run(o: &Opts) {
             continue;
         }
         if text.starts_with('/') {
-            println!(
-                "    · commands:  /role <text>   /list   /open <id>   /continue   /new   /bye\n"
-            );
+            if handle_param(text, &mut smp) {
+                continue;
+            }
+            print_help(true);
             continue;
         }
 
@@ -379,7 +489,7 @@ fn cmd_run(o: &Opts) {
             );
         }
         last_memory_sig = sig;
-        let reply = turn(&mut eng, &bundle.messages);
+        let reply = turn(&mut eng, &bundle.messages, &smp);
         history.push(hos::chat::Message::new("assistant", reply.trim()));
 
         // Autosave so the conversation can be reopened with /open.
@@ -479,8 +589,18 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
     };
     // Returns (answer, reasoning_trace, tokens). The answer goes to history; the
     // reasoning is streamed dimmed AND kept for a content-addressed receipt.
+    let mut smp = Sampling {
+        temp: o.temp,
+        top_k: o.top_k,
+        top_p: o.top_p,
+        rep_penalty: o.rep_penalty,
+        repeat_last_n: o.repeat_last_n,
+        n_predict: o.n_predict,
+        seed: o.seed,
+    };
     let turn = |sess: &mut hos::qwen35::ChatSession,
-                history: &[hos::chat::Message]|
+                history: &[hos::chat::Message],
+                s: &Sampling|
      -> (String, String, usize) {
         use hos::qwen35::Chunk;
         print!(
@@ -497,13 +617,13 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
             history,
             img_ref,
             think,
-            o.n_predict,
-            o.temp,
-            o.top_k,
-            o.top_p,
-            o.rep_penalty,
-            o.repeat_last_n,
-            o.seed,
+            s.n_predict,
+            s.temp,
+            s.top_k,
+            s.top_p,
+            s.rep_penalty,
+            s.repeat_last_n,
+            s.seed,
             |chunk| {
                 match chunk {
                     Chunk::Reasoning(t) => {
@@ -539,7 +659,7 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
     if let Some(p) = &o.prompt {
         print!("{}", hos::viz::banner());
         let history = vec![hos::chat::Message::new("user", p)];
-        let (answer, reasoning, n) = turn(&mut sess, &history);
+        let (answer, reasoning, n) = turn(&mut sess, &history, &smp);
         let rr = reasoning::ReasoningReceipt::new(
             "oneshot", 0, p, effort_label, &reasoning, &answer, n,
             serde_json::json!({ "name": name }),
@@ -551,11 +671,7 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
     }
 
     qwen35_banner(&sess, &name, backend);
-    println!(
-        "    {}/role <text> · /continue · /list · /open <id> · /new · /bye{}",
-        hos::viz::faint(),
-        hos::viz::RESET
-    );
+    println!("{}", cmd_hint(true));
     let mut history: Vec<hos::chat::Message> = Vec::new();
     let mut last_memory_sig = String::new();
     let mut chat_id = crate::chats::new_id();
@@ -593,30 +709,23 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
             continue;
         }
         if matches!(text, "/list" | "/chats") {
-            print_chat_list();
+            crate::pick_and_open(&mut history, &mut chat_id);
+            continue;
+        }
+        if matches!(text, "/models" | "/model") {
+            pick_model_reexec(o.gpu, &name);
             continue;
         }
         if let Some(rest) = text.strip_prefix("/open") {
             let id = rest.trim();
             if id.is_empty() {
-                println!("    · usage: /open <id>   (see /list)\n");
+                println!("    · usage: /open <id>   (or just /list to pick)\n");
             } else if let Some(msgs) = load_chat_history(id) {
                 history = msgs;
                 chat_id = id.to_string();
                 replay_history(&history);
             } else {
                 println!("    · no chat '{id}'. try /list\n");
-            }
-            continue;
-        }
-        if matches!(text, "/continue" | "/resume") {
-            match most_recent_saved_chat().filter(|id| load_chat_history(id).is_some()) {
-                Some(id) => {
-                    history = load_chat_history(&id).unwrap();
-                    chat_id = id;
-                    replay_history(&history);
-                }
-                None => println!("    · no saved conversation to continue.\n"),
             }
             continue;
         }
@@ -647,9 +756,10 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
             continue;
         }
         if text.starts_with('/') {
-            println!(
-                "    · commands:  /role <text>   /list   /open <id>   /continue   /new   /bye\n"
-            );
+            if handle_param(text, &mut smp) {
+                continue;
+            }
+            print_help(true);
             continue;
         }
 
@@ -663,7 +773,7 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
             );
         }
         last_memory_sig = sig;
-        let (reply, reasoning, n) = turn(&mut sess, &bundle.messages);
+        let (reply, reasoning, n) = turn(&mut sess, &bundle.messages, &smp);
         history.push(hos::chat::Message::new("assistant", reply.trim()));
         // Capture the reasoning as a content-addressed receipt agents can build on.
         let rr = reasoning::ReasoningReceipt::new(
@@ -791,6 +901,375 @@ fn print_chat_list() {
         println!("  {}{id}{RESET}  {}{title}{RESET}  {}({n} msgs){RESET}", pollen(), ink(), faint());
     }
     println!("    · open one with:  /open <id>\n");
+}
+
+/// Run `stty ARGS` reading the REAL controlling terminal (inherited stdin) and
+/// capture stdout. `Command::output()` nulls stdin — which makes `stty -g`/`stty
+/// size` fail with "not a terminal" — so we must inherit stdin explicitly. Returns
+/// the trimmed output, or None when there's no TTY (so callers degrade gracefully).
+fn tty_stty(args: &[&str]) -> Option<String> {
+    use std::process::{Command, Stdio};
+    let out = Command::new("stty")
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?
+        .wait_with_output()
+        .ok()?;
+    if out.status.success() {
+        String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Interactive arrow-key menu, dependency-free. Puts the terminal in raw mode via
+/// `stty` (restored on drop — even on panic — and the cursor re-shown), draws the
+/// list with the selected row highlighted, and reads keys: ↑/↓ (or k/j) move, Enter
+/// selects, q/Esc/Ctrl-C cancel. Returns the chosen index, or None on cancel / when
+/// stdin isn't a TTY (so callers can fall back to a plain print). Scrolls when the
+/// list is taller than the window.
+fn select_menu(title: &str, items: &[String], footer: &str) -> Option<usize> {
+    use hos::viz::*;
+    use std::io::{Read, Write};
+    if items.is_empty() {
+        return None;
+    }
+    // Capture current termios; a failure means we're not on a TTY -> bail.
+    let saved = match tty_stty(&["-g"]) {
+        Some(s) => s,
+        None => return None,
+    };
+    struct Guard(String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("stty").arg(&self.0).status();
+            print!("\x1b[?25h"); // show cursor
+            let _ = std::io::stdout().flush();
+        }
+    }
+    let _guard = Guard(saved);
+    let _ = std::process::Command::new("stty").args(["raw", "-echo"]).status();
+    print!("\x1b[?25l"); // hide cursor
+
+    let win = items.len().min(12);
+    let mut sel = 0usize;
+    let mut top = 0usize;
+    let paint = |sel: usize, top: usize| -> String {
+        let mut s = String::new();
+        s.push_str(&format!("  {}{}{title}{}\r\n", BOLD, petal(), RESET));
+        for i in top..(top + win).min(items.len()) {
+            if i == sel {
+                s.push_str(&format!("  {}▸ {}{}\r\n", pollen(), items[i], RESET));
+            } else {
+                s.push_str(&format!("    {}{}{}\r\n", ink(), items[i], RESET));
+            }
+        }
+        s.push_str(&format!("  {}{footer}{}\r\n", faint(), RESET));
+        s
+    };
+    let block = win + 2; // title + rows + footer
+    print!("\r\n{}", paint(sel, top));
+    std::io::stdout().flush().ok();
+
+    let mut stdin = std::io::stdin();
+    let mut b = [0u8; 1];
+    let chosen = loop {
+        if stdin.read(&mut b).unwrap_or(0) == 0 {
+            break None;
+        }
+        match b[0] {
+            b'\r' | b'\n' => break Some(sel),
+            b'q' | 3 => break None, // q or Ctrl-C
+            27 => {
+                // ESC: an arrow sequence (ESC [ A/B), or a lone Esc (cancel). Read
+                // one byte at a time — `read` may return fewer than requested.
+                let mut c = [0u8; 1];
+                if stdin.read(&mut c).unwrap_or(0) == 1 && c[0] == b'[' {
+                    if stdin.read(&mut c).unwrap_or(0) == 1 {
+                        match c[0] {
+                            b'A' if sel > 0 => sel -= 1,
+                            b'B' if sel + 1 < items.len() => sel += 1,
+                            _ => {}
+                        }
+                    }
+                } else {
+                    break None;
+                }
+            }
+            b'k' if sel > 0 => sel -= 1,
+            b'j' if sel + 1 < items.len() => sel += 1,
+            _ => {}
+        }
+        if sel < top {
+            top = sel;
+        }
+        if sel >= top + win {
+            top = sel + 1 - win;
+        }
+        print!("\x1b[{block}A\x1b[0J{}", paint(sel, top));
+        std::io::stdout().flush().ok();
+    };
+    // Erase the whole menu block on exit so it leaves no residue (one blank line of
+    // padding above remains). Cursor ends where the menu started.
+    print!("\x1b[{block}A\r\x1b[0J");
+    std::io::stdout().flush().ok();
+    chosen
+}
+
+/// The model dirs `flwr`/`hos` search, in priority order.
+fn model_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(d) = std::env::var("HOS_MODELS_DIR") {
+        dirs.push(PathBuf::from(d));
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        dirs.push(Path::new(&h).join("Documents/hos/models"));
+        dirs.push(Path::new(&h).join(".hos/models"));
+    }
+    dirs
+}
+
+/// Names a `/models` pick can switch to: store entries + `.gguf`/`.hos`/`.flwr`
+/// files and HF checkpoint dirs in the model directories, de-duped and sorted.
+fn switchable_models() -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for m in store::all() {
+        names.insert(m.name);
+    }
+    for d in model_search_dirs() {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let nm = e.file_name().to_string_lossy().into_owned();
+                let ext = p.extension().and_then(|x| x.to_str());
+                let is_model =
+                    ext == Some("gguf") || ext == Some("hos") || ext == Some("flwr");
+                let is_hf = p.is_dir() && p.join("config.json").exists();
+                if is_model || is_hf {
+                    names.insert(nm);
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Resolve a model name to a path WITHOUT exiting the process (unlike
+/// `resolve_model`) — for the live `/models` switch, where a bad pick should be a
+/// message, not a crash.
+fn resolve_model_opt(name: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(name);
+    if direct.exists() {
+        return Some(direct);
+    }
+    if let Some(p) = store::resolve(name) {
+        return Some(p);
+    }
+    for d in model_search_dirs() {
+        let c = d.join(name);
+        if c.exists() {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// One-line status bar, printed under the banner and after each reply: a live
+/// activity readout (model · speed · memory · turns) plus the essential command
+/// shortcuts, so both the meter and the commands stay visible as the conversation
+/// scrolls — no scroll-region tricks, just a line that flows with the content.
+/// Shared by every REPL (llama / gemma4 / qwen35) so the look is consistent.
+/// The compact command line shown once under the banner (kept short; `/help` lists
+/// everything). `full` is the llama/qwen35 set; the gemma REPL is more minimal.
+pub fn cmd_hint(full: bool) -> String {
+    use hos::viz::*;
+    let cmds = if full {
+        "/models · /list · /role · /new · /param · /help · /bye"
+    } else {
+        "/models · /reset · /param · /help · /bye"
+    };
+    format!("    {}{cmds}{}", faint(), RESET)
+}
+
+/// `/help` — list every command (including the ones not in the compact hint).
+pub fn print_help(full: bool) {
+    use hos::viz::*;
+    let row = |c: &str, d: &str| println!("    {}{:<14}{}{}", petal(), c, RESET, d);
+    println!("\n  {}commands{}", BOLD, RESET);
+    row("/models", "switch the resident model");
+    if full {
+        row("/list", "open a saved conversation (arrow-pick)");
+        row("/open <id>", "open a conversation by its id");
+        row("/role <text>", "set a system instruction (persists this chat)");
+        row("/new", "start a fresh conversation");
+    } else {
+        row("/reset", "clear the conversation");
+    }
+    row("/param", "view or set  temp / max / top_k / top_p / seed / penalty");
+    row("/help", "this list");
+    row("/bye", "quit");
+    println!();
+}
+
+/// Live-editable sampling knobs (via `/param`), seeded from the CLI flags.
+#[derive(Clone)]
+pub struct Sampling {
+    pub temp: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub rep_penalty: f32,
+    pub repeat_last_n: usize,
+    pub n_predict: usize,
+    pub seed: u64,
+}
+impl Sampling {
+    pub fn show(&self) {
+        use hos::viz::*;
+        let r = |k: &str, v: String| println!("    {}{:<9}{}{}", faint(), k, RESET, v);
+        println!("\n  {}params{}", BOLD, RESET);
+        r("temp", self.temp.to_string());
+        r("top_k", self.top_k.to_string());
+        r("top_p", self.top_p.to_string());
+        r("max", format!("{}   (max new tokens per reply)", self.n_predict));
+        r("seed", self.seed.to_string());
+        r("penalty", self.rep_penalty.to_string());
+        println!("    {}· set with:  /param <key> <value>{}\n", faint(), RESET);
+    }
+    /// Apply `/param <key> <value>`; returns a human-readable result message.
+    pub fn set(&mut self, key: &str, val: &str) -> String {
+        macro_rules! num {
+            ($f:expr, $label:expr) => {
+                match val.parse() {
+                    Ok(v) => {
+                        $f = v;
+                        format!("{} = {v}", $label)
+                    }
+                    Err(_) => format!("'{val}' is not a valid {}", $label),
+                }
+            };
+        }
+        match key {
+            "temp" => num!(self.temp, "temp"),
+            "top_k" => num!(self.top_k, "top_k"),
+            "top_p" => num!(self.top_p, "top_p"),
+            "max" | "n_predict" | "tokens" => num!(self.n_predict, "max"),
+            "seed" => num!(self.seed, "seed"),
+            "penalty" | "rep_penalty" => num!(self.rep_penalty, "penalty"),
+            _ => format!("unknown param '{key}'  (temp / top_k / top_p / max / seed / penalty)"),
+        }
+    }
+}
+
+/// Handle a `/param [key value]` command line. Returns true if it was a /param.
+pub fn handle_param(text: &str, smp: &mut Sampling) -> bool {
+    let Some(rest) = text.strip_prefix("/param") else {
+        return false;
+    };
+    let args: Vec<&str> = rest.split_whitespace().collect();
+    match args.as_slice() {
+        [] => smp.show(),
+        [k, v] => println!("    · {}\n", smp.set(k, v)),
+        _ => println!("    · usage:  /param            show all\n    ·         /param temp 0.8   set one\n"),
+    }
+    true
+}
+
+/// Resident-set size of this process in MB (via `ps`), for the activity monitor.
+fn current_rss_mb() -> u64 {
+    let pid = std::process::id().to_string();
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|kb| kb / 1024)
+        .unwrap_or(0)
+}
+
+/// Shared `/list` picker: choose a saved conversation with the arrow menu and load
+/// it into `history`/`chat_id`. Falls back to a plain printed list off a TTY. Used
+/// by every REPL so conversation-opening looks the same everywhere.
+pub fn pick_and_open(history: &mut Vec<hos::chat::Message>, chat_id: &mut String) {
+    let list = crate::chats::list();
+    let items = list["data"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        println!("    · no saved conversations yet.\n");
+        return;
+    }
+    let labels: Vec<String> = items
+        .iter()
+        .map(|it| {
+            let title = it["title"].as_str().unwrap_or("untitled");
+            let n = it["messages"].as_u64().unwrap_or(0);
+            format!("{title}   ({n} msgs)")
+        })
+        .collect();
+    match select_menu("open conversation", &labels, "↑/↓ move · enter open · q cancel") {
+        Some(i) => {
+            if let Some(id) = items[i]["id"].as_str() {
+                if let Some(msgs) = load_chat_history(id) {
+                    *history = msgs;
+                    *chat_id = id.to_string();
+                    replay_history(history);
+                } else {
+                    println!("    · could not open that conversation.\n");
+                }
+            }
+        }
+        None => print_chat_list(),
+    }
+}
+
+/// Shared `/models` picker for the gemma4 / qwen35 REPLs: choose a model and hand
+/// off to a fresh REPL of the right family by re-exec'ing flwr (those backends can't
+/// swap the resident engine in place; the generic Engine REPL does an in-place swap
+/// for same-family models instead).
+pub fn pick_model_reexec(gpu: bool, current: &str) {
+    let models = switchable_models();
+    if models.is_empty() {
+        println!("    · no models found in the model directories.\n");
+        return;
+    }
+    let labels: Vec<String> = models
+        .iter()
+        .map(|m| if m == current { format!("{m}   (current)") } else { m.clone() })
+        .collect();
+    let Some(i) = select_menu("switch model", &labels, "↑/↓ move · enter load · q cancel") else {
+        return;
+    };
+    let pick = models[i].clone();
+    if pick == current {
+        println!("    · already on {pick}.\n");
+        return;
+    }
+    if resolve_model_opt(&pick).is_none() {
+        println!("    · could not find '{pick}'.\n");
+        return;
+    }
+    print!("\x1b[?25h\x1b[2J\x1b[H");
+    std::io::stdout().flush().ok();
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("flwr"));
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("run").arg(&pick);
+    if !gpu {
+        cmd.arg("--cpu");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec(); // replaces this process on success
+        eprintln!("    · could not switch to {pick}: {err}");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd.status();
+        std::process::exit(0);
+    }
 }
 
 /// `flwr membench [chat-id]` — measure conversation compression: raw vs packed

@@ -139,7 +139,12 @@ impl Backend {
     /// Load a backend for `path`, picking the gemma4 or qwen35 session for those
     /// custom arches and the generic `Engine` for everything else.
     pub fn load(path: &Path, gpu: bool) -> Result<Backend, String> {
-        if crate::gemma4_chat::is_gemma4(path) {
+        // Route BOTH a Gemma-4 HF checkpoint dir AND a native `.hos` gemma4 capsule
+        // to the native decoder. `Session::load` dispatches on `is_gemma4_capsule`
+        // internally (via `Gemma4::from_capsule`); serve previously only checked the
+        // directory form, so a gemma4 `.hos` fell through to the generic GGUF loader
+        // and failed with "missing model metadata: tokenizer.ggml.tokens".
+        if crate::gemma4_chat::is_gemma4(path) || crate::gemma4_chat::is_gemma4_capsule(path) {
             return crate::gemma4_chat::Session::load(path, gpu)
                 .map(|sess| Backend::Gemma4 { sess, rng: 42 })
                 .map_err(|e| e.to_string());
@@ -217,6 +222,14 @@ enum Job {
     },
 }
 
+/// Live activity for the `GET /monitor` endpoint + the web UI's bottom meter.
+#[derive(Default)]
+struct ServeStats {
+    requests: u64,
+    tokens: u64,
+    last_tok_s: f64,
+}
+
 /// Block serving requests until the process is killed. `gpu` is reused when
 /// switching models at runtime.
 pub fn serve(mut backend: Backend, model_name: &str, host: &str, port: u16, gpu: bool) {
@@ -234,16 +247,20 @@ pub fn serve(mut backend: Backend, model_name: &str, host: &str, port: u16, gpu:
     // The currently-resident model name — shared so connection threads can read
     // it (for /v1/models and provenance) while the engine thread updates it.
     let model = Arc::new(Mutex::new(model_name.to_string()));
+    let stats = Arc::new(Mutex::new(ServeStats::default()));
+    let started = std::time::Instant::now();
     let (tx, rx) = mpsc::channel::<Job>();
     let accept_model = model.clone();
+    let accept_stats = stats.clone();
     // Accept + parse off the engine thread: one reader thread per connection.
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(stream) = conn else { continue };
             let tx = tx.clone();
             let m = accept_model.clone();
+            let st = accept_stats.clone();
             thread::spawn(move || {
-                if let Err(e) = dispatch(stream, m, tx) {
+                if let Err(e) = dispatch(stream, m, tx, st, started) {
                     eprintln!("  ! connection error: {e}");
                 }
             });
@@ -256,8 +273,17 @@ pub fn serve(mut backend: Backend, model_name: &str, host: &str, port: u16, gpu:
         match job {
             Job::Chat(c) => {
                 let name = model.lock().map(|g| g.clone()).unwrap_or_default();
-                if let Err(e) = run_chat(&mut backend, &name, c) {
-                    eprintln!("  ! generation write error: {e}");
+                let t0 = std::time::Instant::now();
+                match run_chat(&mut backend, &name, c) {
+                    Ok(n) => {
+                        let secs = t0.elapsed().as_secs_f64();
+                        if let Ok(mut s) = stats.lock() {
+                            s.requests += 1;
+                            s.tokens += n as u64;
+                            s.last_tok_s = n as f64 / secs.max(1e-9);
+                        }
+                    }
+                    Err(e) => eprintln!("  ! generation write error: {e}"),
                 }
             }
             Job::Switch { name, reply } => match resolve(&name) {
@@ -362,6 +388,8 @@ fn dispatch(
     mut stream: TcpStream,
     model: Arc<Mutex<String>>,
     tx: Sender<Job>,
+    stats: Arc<Mutex<ServeStats>>,
+    started: std::time::Instant,
 ) -> std::io::Result<()> {
     let model_name = model.lock().map(|g| g.clone()).unwrap_or_default();
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -426,6 +454,26 @@ fn dispatch(
             Err(msg) => write_json(&mut stream, 400, &json!({ "error": { "message": msg } })),
         },
 
+        // Live activity meter feed (the web UI's bottom strip polls this).
+        ("GET", "/monitor") => {
+            let cur = model.lock().map(|g| g.clone()).unwrap_or_default();
+            let (req, tok, tps) = stats
+                .lock()
+                .map(|s| (s.requests, s.tokens, s.last_tok_s))
+                .unwrap_or((0, 0, 0.0));
+            write_json(
+                &mut stream,
+                200,
+                &json!({
+                    "model": cur,
+                    "requests": req,
+                    "tokens": tok,
+                    "last_tok_s": (tps * 10.0).round() / 10.0,
+                    "uptime_s": started.elapsed().as_secs(),
+                    "memory_mb": crate::current_rss_mb(),
+                }),
+            )
+        }
         // Model selection: list available models, and switch the resident one.
         ("GET", "/models/available") => write_json(&mut stream, 200, &available_models()),
         ("POST", "/model") => {
@@ -694,7 +742,7 @@ fn save_reasoning_receipt(
 }
 
 /// Generate a reply on the engine thread and write it to the job's connection.
-fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::Result<()> {
+fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::Result<usize> {
     let p = &job.params;
     let bundle = crate::memory::assemble(&job.msgs);
     let chat_msgs = if bundle.omitted_messages > 0 {
@@ -773,7 +821,7 @@ fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::R
             "  -> {n} tok  {:.2}s (stream)",
             started.elapsed().as_secs_f64()
         );
-        Ok(())
+        Ok(n)
     } else {
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -813,7 +861,8 @@ fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::R
             } ],
             "usage": { "completion_tokens": n }
         });
-        write_json(&mut job.stream, 200, &payload)
+        write_json(&mut job.stream, 200, &payload)?;
+        Ok(n)
     }
 }
 
@@ -846,8 +895,11 @@ fn write_json_raw(stream: &mut TcpStream, code: u16, body: &str) -> std::io::Res
 }
 
 fn write_html(stream: &mut TcpStream, html: &str) -> std::io::Result<()> {
+    // The UI (HTML + inline JS) ships inside the binary and changes with each build,
+    // so never let the browser cache it — a stale cached page is why a rebuilt server
+    // can still show an old UI (and an old, broken model switcher). Always fresh.
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store, must-revalidate\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
         html.len()
     );
     stream.write_all(resp.as_bytes())?;
@@ -932,6 +984,12 @@ const CHAT_HTML: &str = r##"<!doctype html>
     border-radius:5px;background:var(--soft);color:var(--ink);padding:10px 12px;font:inherit;min-height:54px}
   .sysbox:focus{outline:none;border-color:var(--accent)}
   .sysbox.show{display:block}
+  /* tiny activity meter, pinned above the composer */
+  .meter{position:fixed;right:14px;bottom:84px;z-index:6;display:flex;gap:7px;align-items:center;
+    font-size:11px;letter-spacing:.03em;color:var(--accent);background:var(--soft);
+    border:1px solid var(--line);border-radius:999px;padding:4px 11px;opacity:.9;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .meter .sep{opacity:.4}
 </style>
 </head>
 <body>
@@ -957,6 +1015,7 @@ const CHAT_HTML: &str = r##"<!doctype html>
   <textarea id="in" placeholder="Message flwr…  (Enter to send · Shift+Enter for a newline)"></textarea>
   <button id="send">Send</button>
 </div></div>
+<div class="meter" id="meter">❀ idle</div>
 <footer>HOS — one body, not a pile of organs</footer>
 <script>
 const log=document.getElementById('log'), input=document.getElementById('in'),
@@ -1006,9 +1065,12 @@ modelsel.onchange=async ()=>{
   try{
     const r=await (await fetch('/model',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({name})})).json();
-    if(r.ok){ activeModel=r.model; meta.textContent='model: '+r.model; }
-    else { meta.textContent='switch failed: '+(r.error||'?'); modelsel.value=activeModel; }
-  }catch(e){ meta.textContent='switch failed'; modelsel.value=activeModel; }
+    if(r.ok){ activeModel=r.model; meta.textContent='model: '+r.model;
+      const b=turn('flwr','flwr'); b.textContent='· switched to '+r.model; }
+    else { meta.textContent='switch failed'; modelsel.value=activeModel;
+      const b=turn('flwr','flwr'); b.textContent='could not load '+name+' — '+(r.error||'unknown'); }
+  }catch(e){ meta.textContent='switch failed'; modelsel.value=activeModel;
+    const b=turn('flwr','flwr'); b.textContent='could not switch models — '+e; }
   send.disabled=false; modelsel.disabled=false; input.focus();
 };
 initModels();
@@ -1109,6 +1171,22 @@ async function saveCurrent(){
 }
 document.getElementById('newchat').onclick=newChat;
 refreshChats();
+
+// ---- bottom activity meter: poll /monitor and render a tiny live strip ----
+const meterEl=document.getElementById('meter');
+async function pollMeter(){
+  try{
+    const m=await (await fetch('/monitor')).json();
+    const sp=m.last_tok_s>0?(m.last_tok_s.toFixed(1)+' tok/s'):'idle';
+    const up=m.uptime_s<60?m.uptime_s+'s':Math.floor(m.uptime_s/60)+'m';
+    meterEl.innerHTML='❀ '+(m.model||'model')
+      +' <span class="sep">·</span> '+sp
+      +' <span class="sep">·</span> '+(m.memory_mb||0)+' MB'
+      +' <span class="sep">·</span> '+(m.requests||0)+' req'
+      +' <span class="sep">·</span> up '+up;
+  }catch(e){ meterEl.textContent='❀ offline'; }
+}
+pollMeter(); setInterval(pollMeter, 2000);
 </script>
 </body>
 </html>"##;

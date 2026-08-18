@@ -37,13 +37,13 @@ pub fn run(path: &Path, o: &Opts) {
             std::process::exit(1);
         }
     };
-    let gp = GenParams {
-        n_predict: o.n_predict,
+    let mut smp = crate::Sampling {
         temp: o.temp,
         top_k: o.top_k,
         top_p: o.top_p,
         rep_penalty: o.rep_penalty,
         repeat_last_n: o.repeat_last_n,
+        n_predict: o.n_predict,
         seed: o.seed,
     };
     let mut rng: u64 = if o.seed == 0 {
@@ -52,7 +52,20 @@ pub fn run(path: &Path, o: &Opts) {
         o.seed
     };
 
-    let say = |sess: &Session, hist: &[(String, String)], rng: &mut u64| -> String {
+    let say = |sess: &Session,
+               hist: &[(String, String)],
+               rng: &mut u64,
+               s: &crate::Sampling|
+     -> (String, usize) {
+        let gp = GenParams {
+            n_predict: s.n_predict,
+            temp: s.temp,
+            top_k: s.top_k,
+            top_p: s.top_p,
+            rep_penalty: s.rep_penalty,
+            repeat_last_n: s.repeat_last_n,
+            seed: s.seed,
+        };
         print!(
             "  {}{}flwr{}  ",
             hos::viz::BOLD,
@@ -61,25 +74,29 @@ pub fn run(path: &Path, o: &Opts) {
         );
         std::io::stdout().flush().ok();
         let mut reply = String::new();
+        let mut ntok = 0usize;
         sess.generate(hist, &gp, rng, |piece| {
             print!("{piece}");
             std::io::stdout().flush().ok();
             reply.push_str(piece);
+            ntok += 1;
         });
         println!("\n");
-        reply
+        (reply, ntok)
     };
 
     // One-shot mode.
     if let Some(p) = &o.prompt {
         print!("{}", hos::viz::banner());
         let history = vec![("user".to_string(), p.clone())];
-        say(&sess, &history, &mut rng);
+        say(&sess, &history, &mut rng, &smp);
         return;
     }
 
     // Interactive REPL.
     banner(path, o.gpu);
+    let name = friendly_name(path);
+    println!("{}", crate::cmd_hint(false));
     let mut history: Vec<(String, String)> = Vec::new();
     let mut last_memory_sig = String::new();
     let stdin = std::io::stdin();
@@ -98,12 +115,27 @@ pub fn run(path: &Path, o: &Opts) {
             Err(_) => break,
         }
         let text = line.trim();
+        if crate::handle_param(text, &mut smp) {
+            continue;
+        }
         match text {
             "" => continue,
             "/bye" | "/exit" | "/quit" => break,
-            "/reset" => {
+            "/reset" | "/new" => {
                 history.clear();
                 println!("    · memory cleared.\n");
+                continue;
+            }
+            "/models" | "/model" => {
+                crate::pick_model_reexec(o.gpu, &name);
+                continue;
+            }
+            "/help" | "/?" | "/commands" => {
+                crate::print_help(false);
+                continue;
+            }
+            t if t.starts_with('/') => {
+                crate::print_help(false);
                 continue;
             }
             _ => {}
@@ -115,7 +147,7 @@ pub fn run(path: &Path, o: &Opts) {
             eprintln!("    · using memory receipts for {omitted} older messages");
         }
         last_memory_sig = sig;
-        let reply = say(&sess, &compact, &mut rng);
+        let (reply, _ntok) = say(&sess, &compact, &mut rng, &smp);
         history.push(("model".to_string(), reply.trim().to_string()));
     }
     println!("    · session closed.");
