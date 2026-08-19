@@ -310,3 +310,116 @@ pub fn ingest(dir: &Path, out: &Path, quant: u32) -> Result<()> {
     );
     Ok(())
 }
+
+/// Ingest the HF vision tower (`model.visual.*`) into an mmproj `.hos` capsule the
+/// VisionTower loads via HosSource. All tensors are a direct name map (validated
+/// cos~1.0 vs the reference mmproj) except the patch-embed Conv3d, whose 2 temporal
+/// frames are split into `v.patch_embd.weight` + `.weight.1`. LayerNorm (no +1).
+pub fn ingest_vision(dir: &Path, out: &Path, quant: u32) -> Result<bool> {
+    let cfg: serde_json::Value = crate::safetensors::read_json(&dir.join("config.json"))?;
+    let Some(vc) = cfg.get("vision_config") else { return Ok(false) };
+    let vg = |k: &str| vc.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let depth = vg("depth") as usize;
+    if depth == 0 {
+        return Ok(false);
+    }
+    let vhidden = vg("hidden_size") as usize;
+    let vheads = vg("num_heads") as usize;
+    let vffn = vg("intermediate_size") as usize;
+    let patch = vg("patch_size") as usize;
+    let merge = vg("spatial_merge_size").max(1) as usize;
+    let out_hidden = vg("out_hidden_size") as usize;
+    let npos = vg("num_position_embeddings") as usize;
+    let grid = (npos as f64).sqrt() as usize; // 48
+    let image_size = grid * patch; // 768
+    let in_ch = vg("in_channels").max(3) as usize;
+    let kt = vg("temporal_patch_size").max(1) as usize; // 2
+    let ln_eps = vc.get("layer_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
+
+    let st = SafeTensors::open_dir(dir)?;
+
+    let mut meta = serde_json::Map::new();
+    let mut vm = |k: &str, v: u64| { meta.insert(format!("clip.vision.{k}"), serde_json::json!(v)); };
+    vm("image_size", image_size as u64);
+    vm("patch_size", patch as u64);
+    vm("embedding_length", vhidden as u64);
+    vm("feed_forward_length", vffn as u64);
+    vm("block_count", depth as u64);
+    vm("attention.head_count", vheads as u64);
+    vm("projection_dim", out_hidden as u64);
+    vm("spatial_merge_size", merge as u64);
+    meta.insert("clip.vision.attention.layer_norm_epsilon".into(), serde_json::json!(ln_eps));
+
+    let mut raws: Vec<RawTensor> = Vec::new();
+    let push_q = |raws: &mut Vec<RawTensor>, name: &str, hn: &str, st: &SafeTensors| -> Result<()> {
+        let data = st.to_f32(hn)?;
+        let shape = st.shape(hn)?.to_vec();
+        let n = data.len();
+        let bytes = crate::gguf_write::quantize(&data, quant);
+        raws.push(RawTensor { name: name.into(), role: ROLE_WEIGHT, shape, dtype: format::ggml_to_dtype(quant), nfloats: n, bytes });
+        Ok(())
+    };
+    let push_f_data = |raws: &mut Vec<RawTensor>, name: &str, data: Vec<f32>| {
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in &data { bytes.extend_from_slice(&v.to_le_bytes()); }
+        raws.push(RawTensor { name: name.into(), role: ROLE_NORM, shape: vec![data.len()], dtype: DTYPE_F32, nfloats: data.len(), bytes });
+    };
+    let push_f = |raws: &mut Vec<RawTensor>, name: &str, hn: &str, st: &SafeTensors| -> Result<()> {
+        let d = st.to_f32(hn)?;
+        push_f_data(raws, name, d);
+        Ok(())
+    };
+
+    eprintln!("[qwen35-hf] ingesting vision tower ({depth} blocks) ...");
+    for i in 0..depth {
+        let h = |s: &str| format!("model.visual.blocks.{i}.{s}");
+        let v = |s: &str| format!("v.blk.{i}.{s}");
+        push_f(&mut raws, &v("ln1.weight"), &h("norm1.weight"), &st)?;
+        push_f(&mut raws, &v("ln1.bias"), &h("norm1.bias"), &st)?;
+        push_q(&mut raws, &v("attn_qkv.weight"), &h("attn.qkv.weight"), &st)?;
+        push_f(&mut raws, &v("attn_qkv.bias"), &h("attn.qkv.bias"), &st)?;
+        push_q(&mut raws, &v("attn_out.weight"), &h("attn.proj.weight"), &st)?;
+        push_f(&mut raws, &v("attn_out.bias"), &h("attn.proj.bias"), &st)?;
+        push_f(&mut raws, &v("ln2.weight"), &h("norm2.weight"), &st)?;
+        push_f(&mut raws, &v("ln2.bias"), &h("norm2.bias"), &st)?;
+        push_q(&mut raws, &v("ffn_up.weight"), &h("mlp.linear_fc1.weight"), &st)?;
+        push_f(&mut raws, &v("ffn_up.bias"), &h("mlp.linear_fc1.bias"), &st)?;
+        push_q(&mut raws, &v("ffn_down.weight"), &h("mlp.linear_fc2.weight"), &st)?;
+        push_f(&mut raws, &v("ffn_down.bias"), &h("mlp.linear_fc2.bias"), &st)?;
+    }
+    // patch embed: split the Conv3d weight [out, in_ch, kT, patch^2] into kT frames
+    let hp = st.to_f32("model.visual.patch_embed.proj.weight")?;
+    let sp = patch * patch;
+    let frame = |t: usize| -> Vec<f32> {
+        let mut o = vec![0f32; vhidden * in_ch * sp];
+        for oo in 0..vhidden {
+            for c in 0..in_ch {
+                for s in 0..sp {
+                    o[(oo * in_ch + c) * sp + s] = hp[(oo * in_ch * kt + c * kt + t) * sp + s];
+                }
+            }
+        }
+        o
+    };
+    push_f_data(&mut raws, "v.patch_embd.weight", frame(0));
+    if kt > 1 {
+        push_f_data(&mut raws, "v.patch_embd.weight.1", frame(1));
+    }
+    push_f(&mut raws, "v.patch_embd.bias", "model.visual.patch_embed.proj.bias", &st)?;
+    push_f(&mut raws, "v.position_embd.weight", "model.visual.pos_embed.weight", &st)?;
+    push_f(&mut raws, "v.post_ln.weight", "model.visual.merger.norm.weight", &st)?;
+    push_f(&mut raws, "v.post_ln.bias", "model.visual.merger.norm.bias", &st)?;
+    push_q(&mut raws, "mm.0.weight", "model.visual.merger.linear_fc1.weight", &st)?;
+    push_f(&mut raws, "mm.0.bias", "model.visual.merger.linear_fc1.bias", &st)?;
+    push_q(&mut raws, "mm.2.weight", "model.visual.merger.linear_fc2.weight", &st)?;
+    push_f(&mut raws, "mm.2.bias", "model.visual.merger.linear_fc2.bias", &st)?;
+
+    let name = out.file_stem().and_then(|s| s.to_str()).unwrap_or("mmproj");
+    let arch = serde_json::json!({ "architecture": "qwen35-vision", "source": "hf-ingest" });
+    let mut card = Card::new(name, arch);
+    card.mode = "inference".into();
+    card.meta = serde_json::Value::Object(meta);
+    format::save_raw(out, &raws, &card).map_err(HosError::from)?;
+    eprintln!("[qwen35-hf] wrote vision capsule {} ({} tensors)", out.display(), raws.len());
+    Ok(true)
+}

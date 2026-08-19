@@ -36,6 +36,20 @@ impl HosSource {
     /// Load a capsule and return the source plus its tokenizer. Errors if the
     /// capsule is archival (no engine metadata) rather than runnable.
     pub fn open(path: &Path) -> Result<(HosSource, Tokenizer)> {
+        let src = Self::open_source(path)?;
+        // HF-origin capsules carry a serialized tokenizer (`hos.tokenizer`);
+        // GGUF-origin ones carry the GGUF `tokenizer.ggml.*` keys directly.
+        let tok = if src.meta.get("hos.tokenizer").is_some() {
+            Tokenizer::from_value(&src.meta["hos.tokenizer"])?
+        } else {
+            Tokenizer::from_hos(&src.meta)?
+        };
+        Ok((src, tok))
+    }
+
+    /// Open a capsule as a bare `ModelSource` without requiring a tokenizer — for
+    /// auxiliary capsules that carry no vocab (e.g. a vision-tower mmproj).
+    pub fn open_source(path: &Path) -> Result<HosSource> {
         let (raws, card) = format::load_raw(path).map_err(HosError::from)?;
         if !card.meta.is_object() {
             return Err(HosError::Format(
@@ -44,13 +58,6 @@ impl HosSource {
                     .into(),
             ));
         }
-        // HF-origin capsules carry a serialized tokenizer (`hos.tokenizer`);
-        // GGUF-origin ones carry the GGUF `tokenizer.ggml.*` keys directly.
-        let tok = if card.meta.get("hos.tokenizer").is_some() {
-            Tokenizer::from_value(&card.meta["hos.tokenizer"])?
-        } else {
-            Tokenizer::from_hos(&card.meta)?
-        };
         let mut tensors = HashMap::with_capacity(raws.len());
         for r in raws {
             let res = if let Some(gt) = format::dtype_to_ggml(r.dtype) {
@@ -82,13 +89,10 @@ impl HosSource {
             };
             tensors.insert(r.name, res);
         }
-        Ok((
-            HosSource {
-                meta: card.meta,
-                tensors,
-            },
-            tok,
-        ))
+        Ok(HosSource {
+            meta: card.meta,
+            tensors,
+        })
     }
 }
 

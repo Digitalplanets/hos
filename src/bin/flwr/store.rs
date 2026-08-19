@@ -750,6 +750,15 @@ pub fn ingest_hf(src: &str, dst: &str, target: &str) {
         let _ = std::fs::remove_dir_all(&dst_dir);
         die("ingest", &format!("{e}"));
     }
+    // Also mint the vision tower as a sibling mmproj capsule (if the model has one).
+    if mt.contains("qwen3_5") {
+        let vout = dst_dir.join(format!("{dst}.mmproj.hos"));
+        match hos::qwen35_hf::ingest_vision(&dir, &vout, ggml) {
+            Ok(true) => println!("  + vision tower -> {}", vout.display()),
+            Ok(false) => {}
+            Err(e) => eprintln!("  · vision ingest skipped: {e}"),
+        }
+    }
     let out_bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     let entries = vec![FileEntry {
         name: out_file.clone(),

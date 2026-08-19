@@ -192,6 +192,16 @@ fn main() {
     match o.cmd.as_str() {
         "__cmphf" => cmd_cmphf(&o),
         "__cmpcap" => cmd_cmpcap(&o),
+        "__cmphfv" => cmd_cmphfv(&o),
+        "__ingestvision" => {
+            let dir = o.model.clone().expect("hf dir");
+            let out = o.dest.clone().expect("out.hos");
+            match hos::qwen35_hf::ingest_vision(std::path::Path::new(&dir), std::path::Path::new(&out), hos::gguf::GGML_Q4_K) {
+                Ok(true) => println!("vision capsule -> {out}"),
+                Ok(false) => println!("no vision_config in that checkpoint"),
+                Err(e) => eprintln!("vision ingest error: {e}"),
+            }
+        }
         "run" => cmd_run(&o),
         "serve" => cmd_serve(&o),
         "membench" | "bench-memory" => cmd_membench(&o),
@@ -502,6 +512,63 @@ fn cmd_cmpcap(o: &Opts) {
     println!("  worst: {worst_name} cos={worst:+.4}");
 }
 
+/// `__cmphfv <mmproj-gguf> <hf-dir>`: validate the vision-tower ingest mapping by
+/// cosine-comparing the reference mmproj GGUF's tensors against the HF visual.*
+/// tensors under our mapping. Reveals qkv reorders / norm conventions / reshapes.
+fn cmd_cmphfv(o: &Opts) {
+    use hos::model::ModelSource;
+    let mmproj = o.model.clone().expect("need mmproj gguf");
+    let hf = o.dest.clone().expect("need hf dir");
+    let g = hos::gguf::Gguf::open(std::path::Path::new(&mmproj)).expect("open mmproj");
+    let st = hos::safetensors::SafeTensors::open_dir(std::path::Path::new(&hf)).expect("open hf");
+    let cos = |a: &[f32], b: &[f32]| -> f64 {
+        let n = a.len().min(b.len());
+        let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            d += a[i] as f64 * b[i] as f64;
+            na += (a[i] as f64).powi(2);
+            nb += (b[i] as f64).powi(2);
+        }
+        d / (na.sqrt() * nb.sqrt() + 1e-12)
+    };
+    let mut cmp = |label: &str, gname: &str, hname: &str| {
+        let a = match g.dequant(gname) { Ok(v) => v, Err(e) => { println!("  {label:26} GGUF miss {gname}: {e}"); return; } };
+        let b = match st.to_f32(hname) { Ok(v) => v, Err(e) => { println!("  {label:26} HF miss {hname}: {e}"); return; } };
+        let c = cos(&a, &b);
+        println!("  {label:26} n(g={} h={}) cos={c:+.4} {}", a.len(), b.len(), if c > 0.9 { "OK" } else { "??" });
+    };
+    let vb = "model.visual.blocks.0";
+    println!("== vision block 0 ==");
+    cmp("ln1 <- norm1.w", "v.blk.0.ln1.weight", &format!("{vb}.norm1.weight"));
+    cmp("ln1_b <- norm1.b", "v.blk.0.ln1.bias", &format!("{vb}.norm1.bias"));
+    cmp("attn_qkv.w <- attn.qkv.w", "v.blk.0.attn_qkv.weight", &format!("{vb}.attn.qkv.weight"));
+    cmp("attn_qkv.b <- attn.qkv.b", "v.blk.0.attn_qkv.bias", &format!("{vb}.attn.qkv.bias"));
+    cmp("attn_out.w <- attn.proj.w", "v.blk.0.attn_out.weight", &format!("{vb}.attn.proj.weight"));
+    cmp("ln2 <- norm2.w", "v.blk.0.ln2.weight", &format!("{vb}.norm2.weight"));
+    cmp("ffn_up <- fc1.w", "v.blk.0.ffn_up.weight", &format!("{vb}.mlp.linear_fc1.weight"));
+    cmp("ffn_down <- fc2.w", "v.blk.0.ffn_down.weight", &format!("{vb}.mlp.linear_fc2.weight"));
+    println!("== patch / pos / merger ==");
+    cmp("patch_embd.w", "v.patch_embd.weight", "model.visual.patch_embed.proj.weight");
+    cmp("patch_embd.b", "v.patch_embd.bias", "model.visual.patch_embed.proj.bias");
+    cmp("position_embd", "v.position_embd.weight", "model.visual.pos_embed.weight");
+    cmp("post_ln <- merger.norm.w", "v.post_ln.weight", "model.visual.merger.norm.weight");
+    cmp("mm.0 <- merger.fc1.w", "mm.0.weight", "model.visual.merger.linear_fc1.weight");
+    cmp("mm.2 <- merger.fc2.w", "mm.2.weight", "model.visual.merger.linear_fc2.weight");
+    // patch_embd: HF Conv3d [out=1152, in_ch=3, kT=2, 16,16] -> split temporal frames
+    let hp = st.to_f32("model.visual.patch_embed.proj.weight").unwrap_or_default();
+    let (out_c, ic, kt, sp) = (1152usize, 3usize, 2usize, 256usize);
+    let frame = |t: usize| -> Vec<f32> {
+        let mut o = vec![0f32; out_c * ic * sp];
+        for oo in 0..out_c { for c in 0..ic { for s in 0..sp {
+            o[(oo * ic + c) * sp + s] = hp[(oo * ic * kt + c * kt + t) * sp + s];
+        }}}
+        o
+    };
+    println!("== patch temporal split ==");
+    println!("  v.patch_embd.weight   vs frame0  cos={:+.4}", cos(&g.dequant("v.patch_embd.weight").unwrap_or_default(), &frame(0)));
+    println!("  v.patch_embd.weight.1 vs frame1  cos={:+.4}", cos(&g.dequant("v.patch_embd.weight.1").unwrap_or_default(), &frame(1)));
+}
+
 fn cmd_run(o: &Opts) {
     let path = resolve_model(o.model.clone());
     // Gemma-4 is a custom HOS arch (not the generic Engine path); route it to its
@@ -801,7 +868,7 @@ fn find_sibling_mmproj(model: &Path) -> Option<String> {
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let n = e.file_name();
         let name = n.to_string_lossy();
-        if name.starts_with("mmproj") && name.ends_with(".gguf") {
+        if (name.starts_with("mmproj") && name.ends_with(".gguf")) || name.ends_with(".mmproj.hos") {
             return Some(e.path().to_string_lossy().into_owned());
         }
     }
@@ -878,22 +945,35 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
     let img_emb: Option<Vec<f32>> = match &o.image {
         Some(imgp) => {
             let mm = o.mmproj.clone().or_else(|| find_sibling_mmproj(path));
-            match mm.and_then(|p| hos::gguf::Gguf::open(std::path::Path::new(&p)).ok()) {
-                Some(mg) => match sess.attach_vision(&mg).and_then(|_| {
+            // The mmproj can be a GGUF or a minted `.mmproj.hos` capsule (HosSource).
+            let attached = mm.as_ref().map(|p| {
+                let mp = std::path::Path::new(p);
+                if p.ends_with(".hos") {
+                    hos::hos_capsule::HosSource::open_source(mp).and_then(|src| sess.attach_vision(&src))
+                } else {
+                    hos::gguf::Gguf::open(mp).and_then(|mg| sess.attach_vision(&mg))
+                }
+            });
+            match attached {
+                Some(Ok(())) => {
                     eprintln!("[flwr] encoding image {imgp} ...");
-                    sess.encode_image(std::path::Path::new(imgp))
-                }) {
-                    Ok(e) => {
-                        eprintln!("[flwr] image -> {} vision tokens", e.len() / 5120);
-                        Some(e)
+                    match sess.encode_image(std::path::Path::new(imgp)) {
+                        Ok(e) => {
+                            eprintln!("[flwr] image -> {} vision tokens", e.len() / 5120);
+                            Some(e)
+                        }
+                        Err(e) => {
+                            eprintln!("[flwr] vision: {e}");
+                            None
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("[flwr] vision: {e}");
-                        None
-                    }
-                },
+                }
+                Some(Err(e)) => {
+                    eprintln!("[flwr] vision load: {e}");
+                    None
+                }
                 None => {
-                    eprintln!("[flwr] --image needs --mmproj <mmproj.gguf> (or a sibling mmproj-*.gguf)");
+                    eprintln!("[flwr] --image needs --mmproj <mmproj> (or a sibling mmproj-*.gguf / *.mmproj.hos)");
                     None
                 }
             }

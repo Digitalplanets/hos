@@ -2572,7 +2572,7 @@ impl ChatSession {
 
     /// Attach a vision tower from an mmproj GGUF so this session can answer about
     /// images (`chat_img`). Optional — text-only sessions never load it.
-    pub fn attach_vision(&mut self, mmproj: &Gguf) -> Result<()> {
+    pub fn attach_vision<S: crate::model::ModelSource>(&mut self, mmproj: &S) -> Result<()> {
         self.vision = Some(crate::qwen35_vision::VisionTower::load(mmproj)?);
         Ok(())
     }
