@@ -42,7 +42,7 @@ pub enum BlockKind {
 }
 
 impl Cfg {
-    pub fn from_gguf(g: &Gguf) -> Result<Cfg> {
+    pub fn from_gguf<S: crate::model::ModelSource>(g: &S) -> Result<Cfg> {
         let k = |s: &str| format!("qwen35.{s}");
         let need = |key: &str| {
             g.meta_u64(&k(key))
@@ -63,10 +63,11 @@ impl Cfg {
                 .meta_u64(&k("attention.key_length"))
                 .unwrap_or(dim as u64 / 16) as usize,
             ffn_dim: need("feed_forward_length")? as usize,
+            // vocab = embed element count / hidden; via ModelSource::raw so this works
+            // for a GGUF, an HF checkpoint, or a .hos capsule alike (no `.tensors`).
             vocab: g
-                .tensors
-                .get("token_embd.weight")
-                .map(|t| t.dims[1] as usize)
+                .raw("token_embd.weight")
+                .map(|(_, _, n)| n / dim)
                 .unwrap_or(0),
             rms_eps: g
                 .meta_f32(&k("attention.layer_norm_rms_epsilon"))
@@ -84,7 +85,7 @@ impl Cfg {
 }
 
 /// Detect each block's kind by which tensors it carries.
-pub fn block_kinds(g: &Gguf, n_layers: usize) -> Vec<BlockKind> {
+pub fn block_kinds<S: crate::model::ModelSource>(g: &S, n_layers: usize) -> Vec<BlockKind> {
     (0..n_layers)
         .map(|i| {
             if g.has(&format!("blk.{i}.ssm_a")) {
@@ -364,7 +365,7 @@ fn rope(v: &mut [f32], n_heads: usize, head_dim: usize, n_rot: usize, pos: usize
 }
 
 impl Qwen35 {
-    pub fn load(g: &Gguf, gpu: Option<&Gpu>) -> Result<Qwen35> {
+    pub fn load<S: crate::model::ModelSource>(g: &S, gpu: Option<&Gpu>) -> Result<Qwen35> {
         let cfg = Cfg::from_gguf(g)?;
         let kinds = block_kinds(g, cfg.n_layers);
         let tok_embd = g.dequant("token_embd.weight")?;
@@ -2527,7 +2528,7 @@ pub struct ChatSession {
 impl ChatSession {
     /// Load a qwen35 GGUF into a ready chat session. `gpu` uses Metal matmuls
     /// (macOS) for the projections; the SSM recurrence runs on CPU.
-    pub fn load(g: &Gguf, tok: Tokenizer, gpu: bool) -> Result<ChatSession> {
+    pub fn load<S: crate::model::ModelSource>(g: &S, tok: Tokenizer, gpu: bool) -> Result<ChatSession> {
         let ctx = g
             .meta_u64("qwen35.context_length")
             .unwrap_or(32768)
