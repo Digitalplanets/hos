@@ -2773,6 +2773,7 @@ impl ChatSession {
             let mut pending: Vec<u8> = Vec::new();
             let mut buf: Vec<u8> = Vec::new();
             let mut pos = pos0;
+            let _t_dec = std::time::Instant::now();
             let n = model.decode_speculative_resident(
                 &mut self.state, rgpu, logits, hidden, max_tokens, temp, top_k, top_p,
                 rep_penalty, repeat_last_n, seed, &stops, gpu,
@@ -2825,6 +2826,10 @@ impl ChatSession {
                 } else {
                     on(Chunk::Answer(&tail));
                 }
+            }
+            if std::env::var("HOS_QWEN35_TIMING").is_ok() {
+                let s = _t_dec.elapsed().as_secs_f64();
+                eprintln!("[qwen35-timing] {n} tokens in {s:.2}s = {:.1} tok/s (resident MTP)", n as f64 / s.max(1e-9));
             }
             return n;
         }
