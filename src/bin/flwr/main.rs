@@ -72,6 +72,7 @@ fn usage() -> ! {
     eprintln!("  flwr show <name>");
     eprintln!("  flwr cp <src> <dst>");
     eprintln!("  flwr quantize <src> <dst> [--type q4_0] [--awq]");
+    eprintln!("  flwr ingest <hf-dir> <dst> [--type q4_k]   (HF checkpoint -> .hos, +vision)");
     eprintln!("  flwr rm <name>");
     eprintln!();
     eprintln!("<model> is a path (.flwr or .hos), a name in the store (flwr pull), or a");
