@@ -1068,7 +1068,7 @@ const CHAT_HTML: &str = r##"<!doctype html>
         </div>
         <div class="grp two">context compression</div>
         <div class="setgrid">
-          <label>ctx tokens<input id="s_ctx" type="number" step="128" min="1"></label>
+          <label>history budget<input id="s_ctx" type="number" step="128" min="1"></label>
           <label>recent turns<input id="s_recent" type="number" step="1" min="1"></label>
           <label>batch msgs<input id="s_batch" type="number" step="1" min="1"></label>
         </div>

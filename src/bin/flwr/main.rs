@@ -1128,7 +1128,7 @@ pub fn print_help(full: bool) {
         row("/reset", "clear the conversation");
     }
     row("/param", "view or set  temp / max / top_k / top_p / seed / penalty");
-    row("/context", "conversation compression  (tokens / recent / batch)");
+    row("/context", "history/compression budget  (/context 3072 · recent · batch)");
     row("/theme", "palette:  light | dark | auto  (for white terminals)");
     row("/help", "this list");
     row("/bye", "quit");
@@ -1256,34 +1256,46 @@ pub fn handle_context(text: &str) -> bool {
         r("recent", crate::memory::recent_turns().to_string(), "recent turns kept verbatim");
         r("batch", crate::memory::batch_messages().to_string(), "older messages per receipt");
         println!(
-            "    {}· set with:  /context <key> <value>   (tokens / recent / batch){}\n",
+            "    {}· set the budget:  /context 3072    ·   /context recent 4  ·  /context batch 8{}\n",
             faint(),
             RESET
         );
     };
+    // Set one knob into the env the memory module reads each turn.
+    let set = |env: &str, key: &str, v: &str| match v.parse::<usize>() {
+        Ok(n) if n > 0 => {
+            std::env::set_var(env, v);
+            println!("    · {key} = {n}\n");
+        }
+        _ => println!("    · '{v}' must be a positive whole number\n"),
+    };
     let args: Vec<&str> = rest.split_whitespace().collect();
     match args.as_slice() {
         [] => show(),
+        // Simple form: a bare number sets the token budget (the common case).
+        [only] => {
+            if only.chars().all(|c| c.is_ascii_digit()) {
+                set("FLWR_CONTEXT_TOKENS", "tokens", only);
+            } else {
+                println!(
+                    "    · usage:  /context 3072          set the token budget\n    ·         /context recent 4     ·   /context batch 8\n"
+                );
+            }
+        }
         [k, v] => {
-            let env = match *k {
-                "tokens" | "ctx" | "context" | "budget" => "FLWR_CONTEXT_TOKENS",
-                "recent" | "turns" => "FLWR_RECENT_TURNS",
-                "batch" | "messages" | "msgs" => "FLWR_MEMORY_BATCH_MESSAGES",
+            let (env, key) = match *k {
+                "tokens" | "ctx" | "context" | "budget" => ("FLWR_CONTEXT_TOKENS", "tokens"),
+                "recent" | "turns" => ("FLWR_RECENT_TURNS", "recent"),
+                "batch" | "messages" | "msgs" => ("FLWR_MEMORY_BATCH_MESSAGES", "batch"),
                 _ => {
                     println!("    · unknown key '{k}'  (tokens / recent / batch)\n");
                     return true;
                 }
             };
-            match v.parse::<usize>() {
-                Ok(n) if n > 0 => {
-                    std::env::set_var(env, v);
-                    println!("    · {k} = {n}\n");
-                }
-                _ => println!("    · '{v}' must be a positive whole number\n"),
-            }
+            set(env, key, v);
         }
         _ => println!(
-            "    · usage:  /context             show all\n    ·         /context tokens 3072\n"
+            "    · usage:  /context 3072          set the token budget\n    ·         /context recent 4     ·   /context batch 8\n"
         ),
     }
     true
