@@ -380,20 +380,45 @@ fn render_memory_system(
             ));
         }
     }
-    if !memory.receipts.is_empty() {
-        lines.push("Prior context receipts:".to_string());
-        for r in memory.receipts.iter().take(10) {
+    // Receipts are relevance-gated. A thin one-line index of every batch is cheap
+    // and always available; the *detail* (keypoints / open items) is expanded only
+    // for receipts whose keywords or subject overlap the latest turn — so a long
+    // conversation stays in budget, yet the model can still recall an old thread the
+    // moment the current turn touches it. Relevance is dependency-free keyword/subject
+    // overlap (the embedding path is reserved for the agent memory tool).
+    let terms = significant_terms(&frame.latest_user);
+    let (relevant, rest): (Vec<&MemoryReceipt>, Vec<&MemoryReceipt>) = memory
+        .receipts
+        .iter()
+        .partition(|r| receipt_relevant(r, &terms, &frame.active_subject));
+    if !relevant.is_empty() {
+        lines.push("Relevant prior receipts (expanded for this turn):".to_string());
+        for r in &relevant {
             lines.push(format!(
-                "- {} messages {}..{}: {}",
+                "- {} [msgs {}..{}]: {}",
                 r.id, r.start_message, r.end_message, r.summary
             ));
+            for k in r.keypoints.iter().take(4) {
+                lines.push(format!("    · {}", k.text));
+            }
+            for t in r.open_tasks.iter().take(3) {
+                lines.push(format!("    · open: {}", t.text));
+            }
         }
     }
-    push_items(&mut lines, "Keypoints", &memory.keypoints);
     push_items(&mut lines, "Open tasks", &memory.open_tasks);
     push_items(&mut lines, "User preferences", &memory.preferences);
     push_items(&mut lines, "Subject relationships", &memory.relationships);
     push_items(&mut lines, "Pinned facts", &memory.pinned);
+    if !rest.is_empty() {
+        lines.push("Other prior receipts (index only — recalled on relevance):".to_string());
+        for r in rest.iter().rev().take(20) {
+            lines.push(format!(
+                "- {} [msgs {}..{}]: {}",
+                r.id, r.start_message, r.end_message, r.summary
+            ));
+        }
+    }
 
     // Greedy fit to the budget. The first line (the instruction) is always kept.
     let mut out: Vec<String> = Vec::new();
@@ -417,6 +442,72 @@ fn push_items(lines: &mut Vec<String>, title: &str, items: &[MemoryItem]) {
     for item in items.iter().take(8) {
         lines.push(format!("- {}", item.text));
     }
+}
+
+/// Common words that carry no topic signal — excluded from relevance matching so a
+/// receipt isn't judged "relevant" just because it shares "the" or "about".
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "you", "your", "that", "this", "with", "have", "has", "was", "were",
+    "are", "will", "would", "could", "should", "what", "when", "where", "which", "who", "how",
+    "why", "can", "just", "like", "about", "into", "from", "they", "them", "there", "here",
+    "then", "than", "some", "any", "all", "not", "but", "our", "out", "get", "got", "let",
+    "its", "it's", "one", "two", "also", "more", "most", "much", "very", "make", "made", "want",
+    "need", "know", "think", "thing", "things", "please", "okay", "yeah", "yes", "sure",
+];
+
+/// Significant lowercase terms from `text`: alphanumeric words of length >= 4 that
+/// aren't stopwords. Used to score a receipt's relevance to the current turn.
+fn significant_terms(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter_map(|w| {
+            let w = w.to_lowercase();
+            if w.len() >= 4 && !STOPWORDS.contains(&w.as_str()) {
+                Some(w)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// A receipt is relevant to the current turn when it mentions the active subject, or
+/// when any significant query term appears in its summary / keypoints / subjects.
+/// Deterministic and dependency-free — no embeddings, no model call.
+fn receipt_relevant(
+    r: &MemoryReceipt,
+    query_terms: &BTreeSet<String>,
+    active_subject: &Option<String>,
+) -> bool {
+    if let Some(subject) = active_subject {
+        let s = subject.to_lowercase();
+        if !s.is_empty()
+            && r.subjects.iter().any(|x| {
+                x.name.to_lowercase().contains(&s)
+                    || x.aliases.iter().any(|a| a.to_lowercase().contains(&s))
+            })
+        {
+            return true;
+        }
+    }
+    if query_terms.is_empty() {
+        return false;
+    }
+    let mut hay = r.summary.to_lowercase();
+    for k in &r.keypoints {
+        hay.push(' ');
+        hay.push_str(&k.text.to_lowercase());
+    }
+    for t in &r.open_tasks {
+        hay.push(' ');
+        hay.push_str(&t.text.to_lowercase());
+    }
+    for s in &r.subjects {
+        hay.push(' ');
+        hay.push_str(&s.name.to_lowercase());
+        hay.push(' ');
+        hay.push_str(&s.context.to_lowercase());
+    }
+    query_terms.iter().any(|term| hay.contains(term.as_str()))
 }
 
 /// A short, sentence-aware digest of a batch of turns. Skips trivial
@@ -1119,5 +1210,74 @@ mod tests {
         let bundle = assemble_with(&msgs, 2048, 8);
         assert_eq!(bundle.omitted_messages, 0);
         assert_eq!(bundle.messages, msgs);
+    }
+
+    fn test_receipt(id: &str, summary: &str, subjects: &[&str]) -> MemoryReceipt {
+        MemoryReceipt {
+            id: id.into(),
+            start_message: 0,
+            end_message: 1,
+            summary: summary.into(),
+            keypoints: Vec::new(),
+            open_tasks: Vec::new(),
+            preferences: Vec::new(),
+            subjects: subjects
+                .iter()
+                .map(|s| SubjectMention {
+                    name: s.to_string(),
+                    aliases: Vec::new(),
+                    source: String::new(),
+                    context: String::new(),
+                })
+                .collect(),
+            relationships: Vec::new(),
+            embedding_ref: None,
+        }
+    }
+
+    #[test]
+    fn relevance_gate_matches_topic_and_subject() {
+        let photo = test_receipt("r1", "discussed photosynthesis and chloroplasts", &["photosynthesis"]);
+        let tax = test_receipt("r2", "reviewed quarterly filing deadlines", &["taxes"]);
+        let terms = significant_terms("can you explain photosynthesis again");
+        assert!(receipt_relevant(&photo, &terms, &None));
+        assert!(!receipt_relevant(&tax, &terms, &None));
+        // active subject alone is enough, even with a vague query
+        let vague = significant_terms("what did we decide");
+        assert!(receipt_relevant(&tax, &vague, &Some("taxes".into())));
+    }
+
+    #[test]
+    fn stopwords_never_trigger_relevance() {
+        let r = test_receipt("r1", "the thing about that plan", &[]);
+        // every word here is a stopword or too short -> no significant terms
+        let terms = significant_terms("what about the thing");
+        assert!(terms.is_empty());
+        assert!(!receipt_relevant(&r, &terms, &None));
+    }
+
+    #[test]
+    fn only_relevant_receipts_expand_in_the_memory_block() {
+        let mut msgs = vec![Message::new("system", "You are concise.")];
+        for i in 0..16 {
+            msgs.push(Message::new("user", &format!("Photosynthesis note {i}: chloroplasts in the leaves convert sunlight and water into glucose over time.")));
+            msgs.push(Message::new("assistant", "understood, that is recorded for later reference in the notes."));
+        }
+        for i in 0..16 {
+            msgs.push(Message::new("user", &format!("Taxes note {i}: the quarterly filing deadline is approaching and receipts must be gathered soon.")));
+            msgs.push(Message::new("assistant", "understood, that is recorded for later reference in the notes."));
+        }
+        // Current turn is about photosynthesis; force compression but leave the memory
+        // block real room (budget/2, capped at 900) so the receipts section renders.
+        msgs.push(Message::new("user", "remind me how photosynthesis works in the leaves"));
+        let bundle = assemble_with(&msgs, 1200, 4);
+        assert!(bundle.omitted_messages > 0, "expected compaction");
+        let block = &bundle.messages[1].content;
+        assert!(block.contains("Internal conversation memory"));
+        // The relevance gate recalled the photosynthesis thread for this turn.
+        assert!(
+            block.contains("Relevant prior receipts"),
+            "expected an expanded relevant receipt; block was:\n{block}"
+        );
     }
 }
