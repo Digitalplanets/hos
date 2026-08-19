@@ -699,6 +699,86 @@ pub fn quantize(src: &str, dst: &str, target: &str, awq: bool) {
     println!("    verify:  hos --perplexity -m {}", out_path.display());
 }
 
+/// Ingest a HuggingFace checkpoint *directory* into a runnable `.hos` capsule in
+/// the store — the from-source path (bf16 safetensors -> HOS quant, streamed).
+/// Detects the arch and routes the `qwen3_5` hybrid to its dedicated streaming
+/// ingest; other families use `hos --ingest` for now.
+pub fn ingest_hf(src: &str, dst: &str, target: &str) {
+    let ggml = hos::gguf_write::target_type(target).unwrap_or(hos::gguf::GGML_Q4_K);
+    let dir = if Path::new(src).is_dir() {
+        PathBuf::from(src)
+    } else {
+        match resolve(src) {
+            Some(p) if p.is_dir() => p,
+            _ => die("ingest", &format!("no HF checkpoint dir '{src}' (a path or a stored name)")),
+        }
+    };
+    if !dir.join("config.json").exists() {
+        die("ingest", "not an HF checkpoint (needs config.json + *.safetensors)");
+    }
+    let dst_dir = store_root().join(dst);
+    if dst_dir.exists() {
+        die("ingest", &format!("'{dst}' already exists — pick another name or `flwr rm {dst}`"));
+    }
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap_or_default())
+            .unwrap_or_default();
+    let mt = cfg
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| cfg.get("text_config").and_then(|t| t.get("model_type")).and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let src_bytes: u64 = std::fs::read_dir(&dir)
+        .ok()
+        .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok().map(|m| m.len())).sum())
+        .unwrap_or(0);
+    std::fs::create_dir_all(&dst_dir).unwrap_or_else(|e| die("ingest", &format!("mkdir: {e}")));
+    let out_file = format!("{dst}.hos");
+    let out = dst_dir.join(&out_file);
+    eprintln!("  ingesting HF checkpoint {} (arch {mt}) -> {dst} ({target}) ...", dir.display());
+    let res = if mt.contains("qwen3_5") {
+        hos::qwen35_hf::ingest(&dir, &out, ggml)
+    } else {
+        let _ = std::fs::remove_dir_all(&dst_dir);
+        die("ingest", &format!(
+            "arch '{mt}' HF ingest isn't wired into flwr yet — for llama/gemma families use:\n    hos --ingest {} -o {dst}.hos --quantize {target}",
+            dir.display()
+        ));
+    };
+    if let Err(e) = res {
+        let _ = std::fs::remove_dir_all(&dst_dir);
+        die("ingest", &format!("{e}"));
+    }
+    let out_bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    let entries = vec![FileEntry {
+        name: out_file.clone(),
+        bytes: out_bytes,
+        hash: fnv_file(&out).unwrap_or_default(),
+    }];
+    let m = Manifest {
+        name: dst.to_string(),
+        kind: "hos".into(),
+        source: format!("hf-ingest ({target})"),
+        revision: "-".into(),
+        entry: Some(out_file),
+        arch: Some(mt.clone()),
+        total_bytes: out_bytes,
+        pulled_unix: now_unix(),
+        identity: identity_of(&entries),
+        files: entries,
+        copied_from: None,
+        quant: Some(target.to_string()),
+    };
+    write_manifest(&dst_dir, &m);
+    println!(
+        "  ✓ ingested {src} -> {dst}  ({} -> {}, arch {mt})",
+        human(src_bytes),
+        human(out_bytes)
+    );
+    println!("    run:  flwr run {dst}");
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 /// Exactly the files HOS loads from an HF checkpoint: the weights (including

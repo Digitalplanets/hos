@@ -230,6 +230,13 @@ fn main() {
             };
             store::quantize(&src, &dst, &o.qtype, o.awq);
         }
+        "ingest" => {
+            let (Some(src), Some(dst)) = (o.model.clone(), o.dest.clone()) else {
+                eprintln!("flwr ingest: need an HF checkpoint dir and a destination name");
+                usage();
+            };
+            store::ingest_hf(&src, &dst, &o.qtype);
+        }
         other => {
             eprintln!("flwr: unknown command '{other}'");
             usage();
@@ -246,7 +253,12 @@ fn cmd_run(o: &Opts) {
         return;
     }
     // qwen35 hybrid (Gated-DeltaNet + attention) is a custom HOS arch on its own
-    // ChatSession backend; everything else stays on the generic Engine.
+    // ChatSession backend; everything else stays on the generic Engine. Route both
+    // a qwen35 GGUF and a minted qwen35 `.hos` capsule (from HF ingest) to it.
+    if is_qwen35_capsule(&path) {
+        cmd_run_qwen35(&path, o);
+        return;
+    }
     if let Ok(g) = hos::gguf::Gguf::open(&path) {
         if hos::model::Arch::detect(&g) == hos::model::Arch::Qwen35Hybrid {
             cmd_run_qwen35(&path, o);
@@ -541,29 +553,64 @@ fn find_sibling_mmproj(model: &Path) -> Option<String> {
 /// `flwr run <qwen35>` — the same interactive/one-shot chat REPL as `cmd_run`,
 /// but driven by the qwen35 `ChatSession` backend (Gated-DeltaNet hybrid). Reuses
 /// the shared memory + persistence helpers, so /role /list /open /continue all work.
+/// True if `path` is a `.hos` capsule whose card records `arch=qwen35` — so a
+/// minted (HF-ingested or GGUF-derived) qwen35 capsule routes to the hybrid loader.
+fn is_qwen35_capsule(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    hos::format::read_card(path)
+        .ok()
+        .and_then(|c| {
+            c.arch
+                .get("architecture")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "qwen35")
+        })
+        .unwrap_or(false)
+}
+
 fn cmd_run_qwen35(path: &Path, o: &Opts) {
     use std::io::Write;
     let name = model_name_of(path);
     let backend = if o.gpu { "metal gpu" } else { "cpu" };
-    let g = match hos::gguf::Gguf::open(path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("[flwr] cannot open model: {e}");
-            return;
+    // A minted `.hos` capsule loads through HosSource (a generic ModelSource); a
+    // GGUF loads through Gguf. ChatSession::load is generic over both.
+    let mut sess = if is_qwen35_capsule(path) {
+        match hos::hos_capsule::HosSource::open(path) {
+            Ok((src, tok)) => match hos::qwen35::ChatSession::load(&src, tok, o.gpu) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[flwr] load: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                eprintln!("[flwr] cannot open capsule: {e}");
+                return;
+            }
         }
-    };
-    let tok = match hos::tokenizer::Tokenizer::from_gguf(&g) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[flwr] tokenizer: {e}");
-            return;
-        }
-    };
-    let mut sess = match hos::qwen35::ChatSession::load(&g, tok, o.gpu) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[flwr] load: {e}");
-            return;
+    } else {
+        let g = match hos::gguf::Gguf::open(path) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[flwr] cannot open model: {e}");
+                return;
+            }
+        };
+        let tok = match hos::tokenizer::Tokenizer::from_gguf(&g) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[flwr] tokenizer: {e}");
+                return;
+            }
+        };
+        match hos::qwen35::ChatSession::load(&g, tok, o.gpu) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[flwr] load: {e}");
+                return;
+            }
         }
     };
 
