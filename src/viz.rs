@@ -11,8 +11,49 @@ pub const BOLD: &str = "\x1b[1m";
 /// dark-on-light (readable black-ish text and saturated accents on white).
 /// Decided once from `FLWR_THEME` (light|dark) or the `COLORFGBG` hint most
 /// terminals export; defaults to the dark palette when unknown.
+/// Runtime theme override set by the `/theme` command: 0 = auto, 1 = light,
+/// 2 = dark. Takes precedence over auto-detect so a user on a terminal that
+/// doesn't answer the background query is never stuck with the wrong palette.
+static THEME_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the palette at runtime: "light", "dark", or "auto". Returns the mode set.
+pub fn set_theme(mode: &str) -> &'static str {
+    use std::sync::atomic::Ordering;
+    match mode.trim().to_lowercase().as_str() {
+        "light" => {
+            THEME_OVERRIDE.store(1, Ordering::Relaxed);
+            "light"
+        }
+        "dark" => {
+            THEME_OVERRIDE.store(2, Ordering::Relaxed);
+            "dark"
+        }
+        _ => {
+            THEME_OVERRIDE.store(0, Ordering::Relaxed);
+            "auto"
+        }
+    }
+}
+
+/// Current palette as a word for display: "light" or "dark".
+pub fn theme_name() -> &'static str {
+    if light_mode() {
+        "light"
+    } else {
+        "dark"
+    }
+}
+
 fn light_mode() -> bool {
+    use std::sync::atomic::Ordering;
     use std::sync::OnceLock;
+    // Runtime override (from /theme) wins over everything, and is re-checked every
+    // call so the palette can flip live without restarting.
+    match THEME_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
     static LIGHT: OnceLock<bool> = OnceLock::new();
     *LIGHT.get_or_init(|| {
         match std::env::var("FLWR_THEME").map(|v| v.to_lowercase()).as_deref() {
@@ -56,21 +97,33 @@ fn query_bg_luminance() -> Option<f32> {
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())?;
     let saved = saved.trim().to_string();
-    // Raw, no echo, non-blocking read with a 0.2s deadline.
+    // Raw, no echo, ~0.1s per read attempt; loop a few times so a terminal that
+    // answers slowly (Terminal.app can lag) still gets read instead of timing out
+    // on the first empty poll and falling back to the dark palette.
     let _ = Command::new("stty")
-        .args(["raw", "-echo", "min", "0", "time", "2"])
+        .args(["raw", "-echo", "min", "0", "time", "1"])
         .status();
     print!("\x1b]11;?\x07"); // ask for the background color
     let _ = std::io::stdout().flush();
+    let mut acc: Vec<u8> = Vec::with_capacity(128);
     let mut buf = [0u8; 64];
-    let n = std::io::stdin().read(&mut buf).unwrap_or(0);
+    // Up to ~0.6s total, and stop early once the reply is terminated (BEL or ST).
+    for _ in 0..6 {
+        let n = std::io::stdin().read(&mut buf).unwrap_or(0);
+        if n > 0 {
+            acc.extend_from_slice(&buf[..n]);
+            if acc.contains(&0x07) || acc.windows(2).any(|w| w == [0x1b, b'\\']) {
+                break;
+            }
+        }
+    }
     // Always restore the terminal, whatever happened.
     let _ = Command::new("stty").arg(&saved).status();
-    if n == 0 {
+    if acc.is_empty() {
         return None;
     }
     // Reply looks like: ESC ] 11 ; rgb:RRRR/GGGG/BBBB  (BEL or ST terminated).
-    let s = String::from_utf8_lossy(&buf[..n]);
+    let s = String::from_utf8_lossy(&acc);
     let rest = &s[s.find("rgb:")? + 4..];
     let mut it = rest.split('/');
     let comp = |p: Option<&str>| -> Option<f32> {
