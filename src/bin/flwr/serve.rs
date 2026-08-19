@@ -183,6 +183,11 @@ struct Params {
     repeat_last_n: usize,
     seed: u64,
     think: hos::qwen35::Think,
+    // Conversation-compression knobs (editable from the web settings panel). Ride
+    // with each request so no shared mutable server state / env mutation is needed.
+    context_tokens: usize,
+    recent_turns: usize,
+    batch_messages: usize,
 }
 
 impl Default for Params {
@@ -199,6 +204,9 @@ impl Default for Params {
             // client that passes `seed` overrides this and gets reproducible output.
             seed: crate::random_seed(),
             think: hos::qwen35::Think::default(),
+            context_tokens: crate::memory::context_budget_tokens(),
+            recent_turns: crate::memory::recent_turns(),
+            batch_messages: crate::memory::batch_messages(),
         }
     }
 }
@@ -689,8 +697,28 @@ fn parse_chat(body: &[u8]) -> Result<(Vec<Message>, Params, bool, Option<Vec<u8>
     if let Some(v) = req["top_p"].as_f64() {
         p.top_p = v as f32;
     }
+    if let Some(v) = req["top_k"].as_u64() {
+        p.top_k = v as usize;
+    }
+    // repetition penalty: accept our own key or the OpenAI-ish frequency_penalty
+    if let Some(v) = req["repetition_penalty"]
+        .as_f64()
+        .or_else(|| req["rep_penalty"].as_f64())
+    {
+        p.rep_penalty = v as f32;
+    }
     if let Some(v) = req["seed"].as_u64() {
         p.seed = v;
+    }
+    // Conversation-compression knobs (web settings panel).
+    if let Some(v) = req["context_tokens"].as_u64() {
+        p.context_tokens = (v as usize).max(1);
+    }
+    if let Some(v) = req["recent_turns"].as_u64() {
+        p.recent_turns = (v as usize).max(1);
+    }
+    if let Some(v) = req["batch_messages"].as_u64() {
+        p.batch_messages = (v as usize).max(1);
     }
     // Reasoning controls (qwen35): OpenAI-style `reasoning_effort`, plus
     // `enable_thinking` (Qwen convention). Ignored by non-reasoning models.
@@ -747,7 +775,12 @@ fn save_reasoning_receipt(
 /// Generate a reply on the engine thread and write it to the job's connection.
 fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::Result<usize> {
     let p = &job.params;
-    let bundle = crate::memory::assemble(&job.msgs);
+    let bundle = crate::memory::assemble_opts(
+        &job.msgs,
+        p.context_tokens,
+        p.recent_turns,
+        p.batch_messages,
+    );
     let chat_msgs = if bundle.omitted_messages > 0 {
         &bundle.messages
     } else {
@@ -987,6 +1020,18 @@ const CHAT_HTML: &str = r##"<!doctype html>
     border-radius:5px;background:var(--soft);color:var(--ink);padding:10px 12px;font:inherit;min-height:54px}
   .sysbox:focus{outline:none;border-color:var(--accent)}
   .sysbox.show{display:block}
+  .settings{display:none;margin-top:9px;border:1px solid var(--line);border-radius:5px;
+    background:var(--soft);padding:11px 12px}
+  .settings.show{display:block}
+  .settings .grp{font-size:9px;letter-spacing:.16em;text-transform:uppercase;opacity:.5;
+    margin:2px 0 8px}
+  .settings .grp.two{margin-top:13px}
+  .setgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 10px}
+  .setgrid label{display:flex;flex-direction:column;gap:3px;font-size:10px;
+    letter-spacing:.06em;opacity:.72}
+  .setgrid input{border:1px solid var(--line);border-radius:4px;background:var(--bg);
+    color:var(--ink);padding:5px 7px;font:inherit;font-size:12px;width:100%;box-sizing:border-box}
+  .setgrid input:focus{outline:none;border-color:var(--accent)}
   /* tiny activity meter, pinned above the composer */
   .meter{position:fixed;right:14px;bottom:84px;z-index:6;display:flex;gap:7px;align-items:center;
     font-size:11px;letter-spacing:.03em;color:var(--accent);background:var(--soft);
@@ -1008,8 +1053,26 @@ const CHAT_HTML: &str = r##"<!doctype html>
       <div class="meta" id="meta">connecting…</div>
       <div class="modelrow"><span class="lbl">MODEL</span><select id="modelsel"></select></div>
       <div class="themebar" id="themebar"><span class="lbl">THEME</span></div>
-      <div class="sysrow"><button class="systoggle" id="systoggle">&#9881; instruction</button></div>
+      <div class="sysrow"><button class="systoggle" id="systoggle">&#9881; instruction</button>
+        <button class="systoggle" id="settoggle">&#9881; settings</button></div>
       <textarea id="sys" class="sysbox" placeholder="Optional: give the model a role or a core instruction. It persists for this conversation."></textarea>
+      <div id="settings" class="settings">
+        <div class="grp">sampling</div>
+        <div class="setgrid">
+          <label>temp<input id="s_temp" type="number" step="0.05" min="0"></label>
+          <label>top_k<input id="s_topk" type="number" step="1" min="0"></label>
+          <label>top_p<input id="s_topp" type="number" step="0.01" min="0" max="1"></label>
+          <label>max tokens<input id="s_max" type="number" step="16" min="1"></label>
+          <label>rep penalty<input id="s_pen" type="number" step="0.05" min="0"></label>
+          <label>seed<input id="s_seed" type="number" step="1" min="0" placeholder="random"></label>
+        </div>
+        <div class="grp two">context compression</div>
+        <div class="setgrid">
+          <label>ctx tokens<input id="s_ctx" type="number" step="128" min="1"></label>
+          <label>recent turns<input id="s_recent" type="number" step="1" min="1"></label>
+          <label>batch msgs<input id="s_batch" type="number" step="1" min="1"></label>
+        </div>
+      </div>
     </header>
     <div id="log"><div class="empty" id="empty">Ask it something below.</div></div>
   </div>
@@ -1095,7 +1158,7 @@ async function ask(){
   try{
     const resp=await fetch('/v1/chat/completions',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({messages,stream:true,max_tokens:512})});
+      body:JSON.stringify(Object.assign({messages,stream:true},settingsBody()))});
     const reader=resp.body.getReader(), dec=new TextDecoder(); let buf='';
     while(true){
       const {done,value}=await reader.read(); if(done) break;
@@ -1128,6 +1191,27 @@ function setSystem(text){
 }
 function syncSystemBox(){ const s=messages.find(m=>m.role==='system'); sysBox.value=s?s.content:''; if(s){ sysBox.classList.add('show'); sysToggle.classList.add('on'); } }
 sysToggle.onclick=()=>{ const on=sysBox.classList.toggle('show'); sysToggle.classList.toggle('on',on); if(on) sysBox.focus(); };
+
+// ---- settings: sampling + context compression (ride with each request) ----
+const SET_DEFAULTS={s_temp:0.7,s_topk:40,s_topp:0.95,s_max:512,s_pen:1.1,s_seed:'',s_ctx:3072,s_recent:8,s_batch:8};
+const setPanel=document.getElementById('settings'), setToggle=document.getElementById('settoggle');
+function loadSettings(){
+  let saved={}; try{ saved=JSON.parse(localStorage.getItem('flwr-settings')||'{}'); }catch(e){}
+  for(const id in SET_DEFAULTS){ const el=document.getElementById(id); if(el){ el.value=(id in saved)?saved[id]:SET_DEFAULTS[id];
+    el.addEventListener('change',saveSettings); } }
+}
+function saveSettings(){ const o={}; for(const id in SET_DEFAULTS){ const el=document.getElementById(id); if(el) o[id]=el.value; }
+  try{ localStorage.setItem('flwr-settings',JSON.stringify(o)); }catch(e){} }
+function settingsBody(){
+  const num=(id,d)=>{ const v=parseFloat((document.getElementById(id)||{}).value); return isNaN(v)?d:v; };
+  const b={ temperature:num('s_temp',0.7), top_k:num('s_topk',40), top_p:num('s_topp',0.95),
+    max_tokens:num('s_max',512), repetition_penalty:num('s_pen',1.1),
+    context_tokens:num('s_ctx',3072), recent_turns:num('s_recent',8), batch_messages:num('s_batch',8) };
+  const seed=(document.getElementById('s_seed')||{}).value; if(seed!==undefined&&(''+seed).trim()!=='') b.seed=parseInt(seed,10);
+  return b;
+}
+setToggle.onclick=()=>{ const on=setPanel.classList.toggle('show'); setToggle.classList.toggle('on',on); };
+loadSettings();
 sysBox.addEventListener('input',()=>setSystem(sysBox.value));
 
 // ---- saved chats (provenance-bearing transcripts on the server) ----

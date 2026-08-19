@@ -462,17 +462,6 @@ fn cmd_run(o: &Opts) {
             }
             continue;
         }
-        if matches!(text, "/continue" | "/resume") {
-            match most_recent_saved_chat().filter(|id| load_chat_history(id).is_some()) {
-                Some(id) => {
-                    history = load_chat_history(&id).unwrap();
-                    chat_id = id;
-                    replay_history(&history);
-                }
-                None => println!("    · no saved conversation to continue.\n"),
-            }
-            continue;
-        }
         if let Some(rest) = text.strip_prefix("/role") {
             let r = rest.trim();
             let has_sys = history.first().map(|m| m.role == "system").unwrap_or(false);
@@ -500,7 +489,7 @@ fn cmd_run(o: &Opts) {
             continue;
         }
         if text.starts_with('/') {
-            if handle_param(text, &mut smp) {
+            if handle_theme(text) || handle_context(text) || handle_param(text, &mut smp) {
                 continue;
             }
             print_help(true);
@@ -784,7 +773,7 @@ fn cmd_run_qwen35(path: &Path, o: &Opts) {
             continue;
         }
         if text.starts_with('/') {
-            if handle_param(text, &mut smp) {
+            if handle_theme(text) || handle_context(text) || handle_param(text, &mut smp) {
                 continue;
             }
             print_help(true);
@@ -1116,9 +1105,9 @@ fn resolve_model_opt(name: &str) -> Option<PathBuf> {
 pub fn cmd_hint(full: bool, seed: u64) -> String {
     use hos::viz::*;
     let cmds = if full {
-        "/models · /list · /role · /new · /param · /help · /bye"
+        "/models · /list · /role · /new · /param · /context · /theme · /help · /bye"
     } else {
-        "/models · /reset · /param · /help · /bye"
+        "/models · /reset · /param · /context · /theme · /help · /bye"
     };
     // seed is shown so a good reply can be reproduced (--seed / /param seed to fix it)
     format!("    {}{cmds}     seed {seed}{}", faint(), RESET)
@@ -1139,6 +1128,8 @@ pub fn print_help(full: bool) {
         row("/reset", "clear the conversation");
     }
     row("/param", "view or set  temp / max / top_k / top_p / seed / penalty");
+    row("/context", "conversation compression  (tokens / recent / batch)");
+    row("/theme", "palette:  light | dark | auto  (for white terminals)");
     row("/help", "this list");
     row("/bye", "quit");
     println!();
@@ -1203,6 +1194,97 @@ pub fn handle_param(text: &str, smp: &mut Sampling) -> bool {
         [] => smp.show(),
         [k, v] => println!("    · {}\n", smp.set(k, v)),
         _ => println!("    · usage:  /param            show all\n    ·         /param temp 0.8   set one\n"),
+    }
+    true
+}
+
+/// Handle `/theme [light|dark|auto]`. The palette normally auto-detects the
+/// terminal background, but terminals that don't answer the background query get
+/// stuck on the dark palette — this forces it. Returns true if it was a /theme.
+pub fn handle_theme(text: &str) -> bool {
+    use hos::viz::*;
+    let Some(rest) = text.strip_prefix("/theme") else {
+        return false;
+    };
+    let arg = rest.trim();
+    if arg.is_empty() {
+        println!("\n  {}theme{}", BOLD, RESET);
+        println!("    {}palette{}  {}", faint(), RESET, theme_name());
+        println!(
+            "    {}· set with:  /theme light | dark | auto{}\n",
+            faint(),
+            RESET
+        );
+    } else {
+        let set = set_theme(arg);
+        // Show a swatch in the freshly-applied palette so the change is visible.
+        println!(
+            "\n    {}theme = {set}{}   {}flwr{} {}petal{} {}sage{} {}ink text{}\n",
+            petal(),
+            RESET,
+            petal(),
+            RESET,
+            deep(),
+            RESET,
+            stem(),
+            RESET,
+            ink(),
+            RESET
+        );
+    }
+    true
+}
+
+/// Handle `/context [key value]` (alias `/ctx`) — the conversation-compression
+/// knobs. Older turns fold into bullet receipts; the recent window stays verbatim;
+/// the whole prompt is capped at `tokens`. Values live in the env the memory module
+/// reads each turn, so edits take effect immediately. Returns true if it was /context.
+pub fn handle_context(text: &str) -> bool {
+    use hos::viz::*;
+    let Some(rest) = text
+        .strip_prefix("/context")
+        .or_else(|| text.strip_prefix("/ctx"))
+    else {
+        return false;
+    };
+    let show = || {
+        let r = |k: &str, v: String, note: &str| {
+            println!("    {}{:<8}{}{:<6} {}{}{}", faint(), k, RESET, v, faint(), note, RESET)
+        };
+        println!("\n  {}context compression{}", BOLD, RESET);
+        r("tokens", crate::memory::context_budget_tokens().to_string(), "total prompt budget");
+        r("recent", crate::memory::recent_turns().to_string(), "recent turns kept verbatim");
+        r("batch", crate::memory::batch_messages().to_string(), "older messages per receipt");
+        println!(
+            "    {}· set with:  /context <key> <value>   (tokens / recent / batch){}\n",
+            faint(),
+            RESET
+        );
+    };
+    let args: Vec<&str> = rest.split_whitespace().collect();
+    match args.as_slice() {
+        [] => show(),
+        [k, v] => {
+            let env = match *k {
+                "tokens" | "ctx" | "context" | "budget" => "FLWR_CONTEXT_TOKENS",
+                "recent" | "turns" => "FLWR_RECENT_TURNS",
+                "batch" | "messages" | "msgs" => "FLWR_MEMORY_BATCH_MESSAGES",
+                _ => {
+                    println!("    · unknown key '{k}'  (tokens / recent / batch)\n");
+                    return true;
+                }
+            };
+            match v.parse::<usize>() {
+                Ok(n) if n > 0 => {
+                    std::env::set_var(env, v);
+                    println!("    · {k} = {n}\n");
+                }
+                _ => println!("    · '{v}' must be a positive whole number\n"),
+            }
+        }
+        _ => println!(
+            "    · usage:  /context             show all\n    ·         /context tokens 3072\n"
+        ),
     }
     true
 }
@@ -1372,14 +1454,6 @@ fn largest_saved_chat() -> Option<String> {
         .iter()
         .max_by_key(|it| it["messages"].as_u64().unwrap_or(0))
         .and_then(|it| it["id"].as_str().map(String::from))
-}
-
-/// The most recently updated saved chat (chats::list is sorted newest-first).
-fn most_recent_saved_chat() -> Option<String> {
-    let list = crate::chats::list();
-    list["data"].as_array()?.first()?["id"]
-        .as_str()
-        .map(String::from)
 }
 
 fn cmd_serve(o: &Opts) {

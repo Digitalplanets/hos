@@ -159,7 +159,12 @@ fn summarize_range(
 }
 
 pub fn assemble(messages: &[Message]) -> ContextBundle {
-    assemble_with(messages, context_budget_tokens(), recent_turns())
+    assemble_opts(
+        messages,
+        context_budget_tokens(),
+        recent_turns(),
+        batch_messages(),
+    )
 }
 
 pub fn assemble_with(
@@ -167,9 +172,23 @@ pub fn assemble_with(
     max_prompt_tokens: usize,
     recent_turn_count: usize,
 ) -> ContextBundle {
+    assemble_opts(messages, max_prompt_tokens, recent_turn_count, batch_messages())
+}
+
+/// Full-control assembly: caller supplies every compression knob (prompt-token
+/// budget, verbatim recent-turn count, and messages-per-receipt batch size), so a
+/// front-end that edits these live (the `/context` command, the server settings
+/// panel) doesn't have to route through env vars.
+pub fn assemble_opts(
+    messages: &[Message],
+    max_prompt_tokens: usize,
+    recent_turn_count: usize,
+    batch_count: usize,
+) -> ContextBundle {
+    let batch_count = batch_count.max(1);
     let raw_tokens = estimate_tokens(messages);
     if raw_tokens <= max_prompt_tokens || messages.len() <= recent_turn_count + 1 {
-        let memory = summarize(messages);
+        let memory = summarize_range(messages, 0, batch_count);
         return ContextBundle {
             messages: messages.to_vec(),
             memory,
@@ -210,7 +229,7 @@ pub fn assemble_with(
 
     let omitted_messages = body.len().saturating_sub(tail.len());
     let omitted = &body[..omitted_messages];
-    let memory = summarize_range(omitted, body_start, batch_messages());
+    let memory = summarize_range(omitted, body_start, batch_count);
     let frame = build_query_frame(messages, &memory);
 
     let mut compacted = leading_systems.clone();
