@@ -20,6 +20,56 @@ use crate::format::{
 use crate::safetensors::SafeTensors;
 use crate::tokenizer::Tokenizer;
 
+/// Reorder value-heads: HF stores them as `[outer groups x inner]`; the forward
+/// (matching the GGUF layout) indexes `[inner x outer]`. Each head spans `hd`
+/// rows (hd=1 for per-head scalars like A_log/dt). Derived empirically (cos~1 vs
+/// the reference), so this is HOS reading its own weights, not a format copy.
+fn reorder_rows(data: &[f32], n_heads: usize, hd: usize, outer: usize, inner: usize) -> Vec<f32> {
+    let cols = data.len() / (n_heads * hd);
+    let mut out = vec![0f32; data.len()];
+    for a in 0..outer {
+        for b in 0..inner {
+            for h in 0..hd {
+                for c in 0..cols {
+                    out[((b * outer + a) * hd + h) * cols + c] =
+                        data[((a * inner + b) * hd + h) * cols + c];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Same reorder but on the INPUT columns (for out_proj: [out_rows, n_heads*hd]).
+fn reorder_cols(data: &[f32], rows: usize, n_heads: usize, hd: usize, outer: usize, inner: usize) -> Vec<f32> {
+    let cols = data.len() / rows;
+    let _ = n_heads;
+    let mut out = vec![0f32; data.len()];
+    for r in 0..rows {
+        for a in 0..outer {
+            for b in 0..inner {
+                for h in 0..hd {
+                    out[r * cols + (b * outer + a) * hd + h] =
+                        data[r * cols + (a * inner + b) * hd + h];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Reorder only the v-segment of a stacked `[q_rows + k_rows + v(n_heads*hd)]`
+/// tensor (in_proj_qkv, conv1d channels); q/k are left as-is.
+fn reorder_v_segment(data: &[f32], qk_rows: usize, n_heads: usize, hd: usize, outer: usize, inner: usize) -> Vec<f32> {
+    let total_rows = qk_rows + n_heads * hd;
+    let cols = data.len() / total_rows;
+    let split = qk_rows * cols;
+    let (qk, v) = data.split_at(split);
+    let mut out = qk.to_vec();
+    out.extend_from_slice(&reorder_rows(v, n_heads, hd, outer, inner));
+    out
+}
+
 /// Map an HF `linear_attn.*` / `self_attn.*` etc. tensor into HOS's internal name,
 /// quantize the big matmul weights, keep norms + the small SSM projections in f32,
 /// and write a runnable capsule. `quant` is the target ggml type for big weights.
@@ -136,15 +186,38 @@ pub fn ingest(dir: &Path, out: &Path, quant: u32) -> Result<()> {
         Ok(())
     };
     let id = |x: f32| x;
+    let plus1 = |x: f32| x + 1.0; // qwen3 norms use the (1+w) convention
     // Gated-DeltaNet A = -exp(A_log) (standard Mamba/DeltaNet), matching the GGUF's
     // already-negative `ssm_a`. VALIDATE against the GGUF once downloaded.
-    let neg_exp = |x: f32| -(x.exp());
+    // Value-head reorder params: HF stores value-heads as [outer groups x inner];
+    // the forward indexes [inner x outer]. Applied to the SSM tensors below.
+    let vh = l_val_heads; // 48 value heads
+    let vhd = l_val_dim; // 128 per-head dim
+    let outer = l_key_heads.max(1); // 16 groups
+    let inner = (vh / outer).max(1); // 3 value-heads per group
+    let qk_rows = 2 * l_key_heads * l_key_dim; // q+k rows in the fused in_proj_qkv
+    // push already-transformed data (quantized big weight / f32 small tensor)
+    let push_q = |raws: &mut Vec<RawTensor>, name: &str, data: Vec<f32>, shape: Vec<usize>, role: u8| {
+        let n = data.len();
+        let bytes = crate::gguf_write::quantize(&data, quant);
+        raws.push(RawTensor { name: name.to_string(), role, shape, dtype: format::ggml_to_dtype(quant), nfloats: n, bytes });
+    };
+    let push_f = |raws: &mut Vec<RawTensor>, name: &str, data: Vec<f32>, shape: Vec<usize>| {
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in &data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        raws.push(RawTensor { name: name.to_string(), role: ROLE_NORM, shape, dtype: DTYPE_F32, nfloats: data.len(), bytes });
+    };
+    let rd = |name: &str| -> Result<(Vec<f32>, Vec<usize>)> {
+        Ok((st.to_f32(name)?, st.shape(name)?.to_vec()))
+    };
 
     eprintln!("[qwen35-hf] ingesting {} layers from {} ...", n_layers, dir.display());
 
     // embeddings + final norm + lm head
     w(&mut raws, "token_embd.weight", "model.language_model.embed_tokens.weight", ROLE_EMBED)?;
-    f(&mut raws, "output_norm.weight", "model.language_model.norm.weight", id)?;
+    f(&mut raws, "output_norm.weight", "model.language_model.norm.weight", plus1)?;
     if st.contains("lm_head.weight") {
         w(&mut raws, "output.weight", "lm_head.weight", ROLE_WEIGHT)?;
     }
@@ -152,8 +225,8 @@ pub fn ingest(dir: &Path, out: &Path, quant: u32) -> Result<()> {
     for (i, lt) in layer_types.iter().enumerate() {
         let hf = |s: &str| format!("model.language_model.layers.{i}.{s}");
         let blk = |s: &str| format!("blk.{i}.{s}");
-        f(&mut raws, &blk("attn_norm.weight"), &hf("input_layernorm.weight"), id)?;
-        f(&mut raws, &blk("post_attention_norm.weight"), &hf("post_attention_layernorm.weight"), id)?;
+        f(&mut raws, &blk("attn_norm.weight"), &hf("input_layernorm.weight"), plus1)?;
+        f(&mut raws, &blk("post_attention_norm.weight"), &hf("post_attention_layernorm.weight"), plus1)?;
         w(&mut raws, &blk("ffn_gate.weight"), &hf("mlp.gate_proj.weight"), ROLE_WEIGHT)?;
         w(&mut raws, &blk("ffn_up.weight"), &hf("mlp.up_proj.weight"), ROLE_WEIGHT)?;
         w(&mut raws, &blk("ffn_down.weight"), &hf("mlp.down_proj.weight"), ROLE_WEIGHT)?;
@@ -163,19 +236,38 @@ pub fn ingest(dir: &Path, out: &Path, quant: u32) -> Result<()> {
             w(&mut raws, &blk("attn_k.weight"), &hf("self_attn.k_proj.weight"), ROLE_WEIGHT)?;
             w(&mut raws, &blk("attn_v.weight"), &hf("self_attn.v_proj.weight"), ROLE_WEIGHT)?;
             w(&mut raws, &blk("attn_output.weight"), &hf("self_attn.o_proj.weight"), ROLE_WEIGHT)?;
-            f(&mut raws, &blk("attn_q_norm.weight"), &hf("self_attn.q_norm.weight"), id)?;
-            f(&mut raws, &blk("attn_k_norm.weight"), &hf("self_attn.k_norm.weight"), id)?;
+            f(&mut raws, &blk("attn_q_norm.weight"), &hf("self_attn.q_norm.weight"), plus1)?;
+            f(&mut raws, &blk("attn_k_norm.weight"), &hf("self_attn.k_norm.weight"), plus1)?;
         } else {
-            // linear_attention (Gated-DeltaNet SSM)
-            w(&mut raws, &blk("attn_qkv.weight"), &hf("linear_attn.in_proj_qkv.weight"), ROLE_WEIGHT)?;
-            w(&mut raws, &blk("attn_gate.weight"), &hf("linear_attn.in_proj_z.weight"), ROLE_WEIGHT)?;
-            w(&mut raws, &blk("ssm_out.weight"), &hf("linear_attn.out_proj.weight"), ROLE_WEIGHT)?;
-            // in_proj_a -> ssm_alpha, in_proj_b -> ssm_beta. VALIDATE the a/b order.
-            f(&mut raws, &blk("ssm_alpha.weight"), &hf("linear_attn.in_proj_a.weight"), id)?;
-            f(&mut raws, &blk("ssm_beta.weight"), &hf("linear_attn.in_proj_b.weight"), id)?;
-            f(&mut raws, &blk("ssm_a"), &hf("linear_attn.A_log"), neg_exp)?;
-            f(&mut raws, &blk("ssm_conv1d.weight"), &hf("linear_attn.conv1d.weight"), id)?;
-            f(&mut raws, &blk("ssm_dt.bias"), &hf("linear_attn.dt_bias"), id)?;
+            // linear_attention (Gated-DeltaNet SSM). The value-heads are reordered
+            // [outer x inner] -> [inner x outer] to match the forward's indexing
+            // (derived cos~1.0 against the reference). Only the v-segment of the
+            // fused qkv / conv is reordered; q/k are untouched.
+            let (qkv, qkv_s) = rd(&hf("linear_attn.in_proj_qkv.weight"))?;
+            push_q(&mut raws, &blk("attn_qkv.weight"),
+                reorder_v_segment(&qkv, qk_rows, vh, vhd, outer, inner), qkv_s, ROLE_WEIGHT);
+            let (z, z_s) = rd(&hf("linear_attn.in_proj_z.weight"))?;
+            push_q(&mut raws, &blk("attn_gate.weight"),
+                reorder_rows(&z, vh, vhd, outer, inner), z_s, ROLE_WEIGHT);
+            let (op, op_s) = rd(&hf("linear_attn.out_proj.weight"))?;
+            let op_rows = op_s[0];
+            push_q(&mut raws, &blk("ssm_out.weight"),
+                reorder_cols(&op, op_rows, vh, vhd, outer, inner), op_s, ROLE_WEIGHT);
+            // per-head scalars (hd=1): in_proj_a -> ssm_alpha, in_proj_b -> ssm_beta
+            let (a, a_s) = rd(&hf("linear_attn.in_proj_a.weight"))?;
+            push_f(&mut raws, &blk("ssm_alpha.weight"), reorder_rows(&a, vh, 1, outer, inner), a_s);
+            let (b, b_s) = rd(&hf("linear_attn.in_proj_b.weight"))?;
+            push_f(&mut raws, &blk("ssm_beta.weight"), reorder_rows(&b, vh, 1, outer, inner), b_s);
+            // ssm_a = -exp(reorder(A_log))
+            let (alog, alog_s) = rd(&hf("linear_attn.A_log"))?;
+            let ssm_a: Vec<f32> = reorder_rows(&alog, vh, 1, outer, inner).iter().map(|&x| -(x.exp())).collect();
+            push_f(&mut raws, &blk("ssm_a"), ssm_a, alog_s);
+            // conv1d channels mirror qkv: reorder the v-segment
+            let (conv, conv_s) = rd(&hf("linear_attn.conv1d.weight"))?;
+            push_f(&mut raws, &blk("ssm_conv1d.weight"),
+                reorder_v_segment(&conv, qk_rows, vh, vhd, outer, inner), conv_s);
+            let (dt, dt_s) = rd(&hf("linear_attn.dt_bias"))?;
+            push_f(&mut raws, &blk("ssm_dt.bias"), reorder_rows(&dt, vh, 1, outer, inner), dt_s);
             f(&mut raws, &blk("ssm_norm.weight"), &hf("linear_attn.norm.weight"), id)?;
         }
     }
@@ -186,22 +278,22 @@ pub fn ingest(dir: &Path, out: &Path, quant: u32) -> Result<()> {
         let hf = |s: &str| format!("mtp.{s}");
         let blk = |s: &str| format!("blk.{mi}.{s}");
         // its own attention sub-block
-        f(&mut raws, &blk("attn_norm.weight"), &hf("layers.0.input_layernorm.weight"), id)?;
-        f(&mut raws, &blk("post_attention_norm.weight"), &hf("layers.0.post_attention_layernorm.weight"), id)?;
+        f(&mut raws, &blk("attn_norm.weight"), &hf("layers.0.input_layernorm.weight"), plus1)?;
+        f(&mut raws, &blk("post_attention_norm.weight"), &hf("layers.0.post_attention_layernorm.weight"), plus1)?;
         w(&mut raws, &blk("attn_q.weight"), &hf("layers.0.self_attn.q_proj.weight"), ROLE_WEIGHT)?;
         w(&mut raws, &blk("attn_k.weight"), &hf("layers.0.self_attn.k_proj.weight"), ROLE_WEIGHT)?;
         w(&mut raws, &blk("attn_v.weight"), &hf("layers.0.self_attn.v_proj.weight"), ROLE_WEIGHT)?;
         w(&mut raws, &blk("attn_output.weight"), &hf("layers.0.self_attn.o_proj.weight"), ROLE_WEIGHT)?;
-        f(&mut raws, &blk("attn_q_norm.weight"), &hf("layers.0.self_attn.q_norm.weight"), id)?;
-        f(&mut raws, &blk("attn_k_norm.weight"), &hf("layers.0.self_attn.k_norm.weight"), id)?;
+        f(&mut raws, &blk("attn_q_norm.weight"), &hf("layers.0.self_attn.q_norm.weight"), plus1)?;
+        f(&mut raws, &blk("attn_k_norm.weight"), &hf("layers.0.self_attn.k_norm.weight"), plus1)?;
         w(&mut raws, &blk("ffn_gate.weight"), &hf("layers.0.mlp.gate_proj.weight"), ROLE_WEIGHT)?;
         w(&mut raws, &blk("ffn_up.weight"), &hf("layers.0.mlp.up_proj.weight"), ROLE_WEIGHT)?;
         w(&mut raws, &blk("ffn_down.weight"), &hf("layers.0.mlp.down_proj.weight"), ROLE_WEIGHT)?;
         // the fusion + norms the MTP head needs
         w(&mut raws, &blk("nextn.eh_proj.weight"), &hf("fc.weight"), ROLE_WEIGHT)?;
-        f(&mut raws, &blk("nextn.enorm.weight"), &hf("pre_fc_norm_embedding.weight"), id)?;
-        f(&mut raws, &blk("nextn.hnorm.weight"), &hf("pre_fc_norm_hidden.weight"), id)?;
-        f(&mut raws, &blk("nextn.shared_head_norm.weight"), &hf("norm.weight"), id)?;
+        f(&mut raws, &blk("nextn.enorm.weight"), &hf("pre_fc_norm_embedding.weight"), plus1)?;
+        f(&mut raws, &blk("nextn.hnorm.weight"), &hf("pre_fc_norm_hidden.weight"), plus1)?;
+        f(&mut raws, &blk("nextn.shared_head_norm.weight"), &hf("norm.weight"), plus1)?;
     }
 
     // ---- write the runnable capsule (arch=qwen35 routes to the qwen35 loader) ----

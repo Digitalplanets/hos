@@ -191,6 +191,7 @@ fn main() {
     let o = parse();
     match o.cmd.as_str() {
         "__cmphf" => cmd_cmphf(&o),
+        "__cmpcap" => cmd_cmpcap(&o),
         "run" => cmd_run(&o),
         "serve" => cmd_serve(&o),
         "membench" | "bench-memory" => cmd_membench(&o),
@@ -293,6 +294,18 @@ fn cmd_cmphf(o: &Opts) {
     let neg = |x: f32| -x;
     let l0 = "model.language_model.layers.0.linear_attn";
     let l3 = "model.language_model.layers.3.self_attn";
+    let plus1 = |x: f32| x + 1.0;
+    println!("== norm (1+w) convention test: as-is vs +1 ==");
+    cmp("attn_norm l0 asis", "blk.0.attn_norm.weight", "model.language_model.layers.0.input_layernorm.weight", id);
+    cmp("attn_norm l0 +1", "blk.0.attn_norm.weight", "model.language_model.layers.0.input_layernorm.weight", plus1);
+    cmp("post_norm l0 asis", "blk.0.post_attention_norm.weight", "model.language_model.layers.0.post_attention_layernorm.weight", id);
+    cmp("post_norm l0 +1", "blk.0.post_attention_norm.weight", "model.language_model.layers.0.post_attention_layernorm.weight", plus1);
+    cmp("q_norm l3 asis", "blk.3.attn_q_norm.weight", &format!("{l3}.q_norm.weight"), id);
+    cmp("q_norm l3 +1", "blk.3.attn_q_norm.weight", &format!("{l3}.q_norm.weight"), plus1);
+    cmp("k_norm l3 asis", "blk.3.attn_k_norm.weight", &format!("{l3}.k_norm.weight"), id);
+    cmp("k_norm l3 +1", "blk.3.attn_k_norm.weight", &format!("{l3}.k_norm.weight"), plus1);
+    cmp("ssm_norm l0 +1", "blk.0.ssm_norm.weight", &format!("{l0}.norm.weight"), plus1);
+    cmp("output_norm +1", "output_norm.weight", "model.language_model.norm.weight", plus1);
     println!("== embeddings / head ==");
     cmp("token_embd", "token_embd.weight", "model.language_model.embed_tokens.weight", id);
     cmp("output(lm_head)", "output.weight", "lm_head.weight", id);
@@ -316,6 +329,177 @@ fn cmd_cmphf(o: &Opts) {
     cmp("ssm_a = A_log", "blk.0.ssm_a", &format!("{l0}.A_log"), id);
     cmp("ssm_a = -A_log", "blk.0.ssm_a", &format!("{l0}.A_log"), neg);
     cmp("ssm_a = -exp(A_log)", "blk.0.ssm_a", &format!("{l0}.A_log"), negexp);
+
+    // ---- derive the value-head reorder empirically (48 = 16 groups x 3) ----
+    // Interpret rows as [outer, inner, cols] and swap outer<->inner. Try both
+    // group splits on the small 48-head tensors; the one scoring cos~1 is it.
+    let reorder = |data: &[f32], rows: usize, outer: usize, inner: usize| -> Vec<f32> {
+        let cols = data.len() / rows;
+        let mut out = vec![0f32; data.len()];
+        for a in 0..outer {
+            for b in 0..inner {
+                for c in 0..cols {
+                    out[(b * outer + a) * cols + c] = data[(a * inner + b) * cols + c];
+                }
+            }
+        }
+        out
+    };
+    let cos_of = |a: &[f32], b: &[f32]| -> f64 {
+        let n = a.len().min(b.len());
+        let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            d += a[i] as f64 * b[i] as f64;
+            na += (a[i] as f64).powi(2);
+            nb += (b[i] as f64).powi(2);
+        }
+        d / (na.sqrt() * nb.sqrt() + 1e-12)
+    };
+    println!("== derive value-head reorder on ssm_alpha (gguf) vs reorder(in_proj_a/b) ==");
+    for (gn, gt) in [("ssm_alpha", "blk.0.ssm_alpha.weight"), ("ssm_beta", "blk.0.ssm_beta.weight")] {
+        let target = g.dequant(gt).unwrap_or_default();
+        let rows = 48usize;
+        for hn in ["in_proj_a", "in_proj_b"] {
+            let src = st.to_f32(&format!("{l0}.{hn}.weight")).unwrap_or_default();
+            for (o, i) in [(16, 3), (3, 16)] {
+                let r = reorder(&src, rows, o, i);
+                println!("  {gn} vs reorder({hn},[{o}x{i}])  cos={:+.4}", cos_of(&target, &r));
+            }
+        }
+    }
+    println!("== derive reorder on ssm_a (48) vs reorder(A_log) with id/-x/-exp ==");
+    let a_src = st.to_f32(&format!("{l0}.A_log")).unwrap_or_default();
+    let ssm_a_gt = g.dequant("blk.0.ssm_a").unwrap_or_default();
+    for (o, i) in [(16, 3), (3, 16), (48, 1)] {
+        for (mn, mf) in [("id", id as fn(f32) -> f32), ("-x", neg), ("-exp", negexp)] {
+            let r: Vec<f32> = reorder(&a_src, 48, o, i).into_iter().map(mf).collect();
+            println!("  ssm_a vs {mn}(reorder(A_log,[{o}x{i}]))  cos={:+.4}", cos_of(&ssm_a_gt, &r));
+        }
+    }
+
+    // head-granular reorder: 48 value-heads as [16x3]->[3x16], each head = head_dim rows
+    let reorder_heads = |data: &[f32], n_heads: usize, hd: usize, outer: usize, inner: usize| -> Vec<f32> {
+        let cols = data.len() / (n_heads * hd);
+        let mut out = vec![0f32; data.len()];
+        for a in 0..outer {
+            for b in 0..inner {
+                for h in 0..hd {
+                    for c in 0..cols {
+                        let dst = ((b * outer + a) * hd + h) * cols + c;
+                        let src = ((a * inner + b) * hd + h) * cols + c;
+                        out[dst] = data[src];
+                    }
+                }
+            }
+        }
+        out
+    };
+    println!("== head-granular reorder [16x3], hd=128 on the big value-head tensors ==");
+    let z = st.to_f32(&format!("{l0}.in_proj_z.weight")).unwrap_or_default();
+    println!("  attn_gate vs reorder_heads(in_proj_z,48,128)  cos={:+.4}",
+        cos_of(&g.dequant("blk.0.attn_gate.weight").unwrap_or_default(), &reorder_heads(&z, 48, 128, 16, 3)));
+    let dt = st.to_f32(&format!("{l0}.dt_bias")).unwrap_or_default();
+    println!("  ssm_dt vs reorder(dt_bias,[16x3])  cos={:+.4}",
+        cos_of(&g.dequant("blk.0.ssm_dt.bias").unwrap_or_default(), &reorder(&dt, 48, 16, 3)));
+    // out_proj [out=5120, in=6144=48*128]: reorder the INPUT columns by head
+    let op = st.to_f32(&format!("{l0}.out_proj.weight")).unwrap_or_default();
+    let op_rows = 5120usize;
+    let reorder_cols = |data: &[f32], rows: usize, n_heads: usize, hd: usize, outer: usize, inner: usize| -> Vec<f32> {
+        let cols = data.len() / rows;
+        let mut out = vec![0f32; data.len()];
+        for r in 0..rows {
+            for a in 0..outer { for b in 0..inner { for h in 0..hd {
+                out[r * cols + (b * outer + a) * hd + h] = data[r * cols + (a * inner + b) * hd + h];
+            }}}
+        }
+        out
+    };
+    println!("  ssm_out vs reorder_cols(out_proj,in=48*128)  cos={:+.4}",
+        cos_of(&g.dequant("blk.0.ssm_out.weight").unwrap_or_default(), &reorder_cols(&op, op_rows, 48, 128, 16, 3)));
+    // attn_qkv [10240,5120] = q(2048)+k(2048)+v(6144): reorder only the v rows by head
+    let qkv = st.to_f32(&format!("{l0}.in_proj_qkv.weight")).unwrap_or_default();
+    let cols = 5120usize;
+    let (qk, v) = qkv.split_at(4096 * cols);
+    let v_re = reorder_heads(v, 48, 128, 16, 3);
+    let mut qkv_re = qk.to_vec();
+    qkv_re.extend_from_slice(&v_re);
+    println!("  attn_qkv vs [q,k, reorder_heads(v)]  cos={:+.4}",
+        cos_of(&g.dequant("blk.0.attn_qkv.weight").unwrap_or_default(), &qkv_re));
+    // conv1d: channels = inner_size + 2*group*state = 6144 + 2*16*128 = 10240; try reorder of the value part
+    let conv = st.to_f32(&format!("{l0}.conv1d.weight")).unwrap_or_default();
+    println!("  ssm_conv1d raw cos={:+.4}  (n={})",
+        cos_of(&g.dequant("blk.0.ssm_conv1d.weight").unwrap_or_default(), &conv), conv.len());
+    // conv channels mirror qkv: q(2048)+k(2048)+v(6144), each with `k` kernel taps.
+    let kernel = conv.len() / 10240;
+    let (qk_c, v_c) = conv.split_at(4096 * kernel);
+    let v_cr = reorder_heads(v_c, 48, 128, 16, 3);
+    let mut conv_re = qk_c.to_vec();
+    conv_re.extend_from_slice(&v_cr);
+    println!("  ssm_conv1d vs [qk, reorder_heads(v)] (kernel={kernel})  cos={:+.4}",
+        cos_of(&g.dequant("blk.0.ssm_conv1d.weight").unwrap_or_default(), &conv_re));
+}
+
+/// `__cmpcap <gguf> <capsule.hos>`: compare the minted capsule against the GGUF
+/// directly (same internal tensor names) + the derived Cfg. Confirms the ingest
+/// produced correct tensors, and prints the first tensor that diverges.
+fn cmd_cmpcap(o: &Opts) {
+    use hos::model::ModelSource;
+    let gguf = o.model.clone().expect("need gguf");
+    let cap = o.dest.clone().expect("need capsule.hos");
+    let g = hos::gguf::Gguf::open(std::path::Path::new(&gguf)).expect("open gguf");
+    let (src, _tok) = hos::hos_capsule::HosSource::open(std::path::Path::new(&cap)).expect("open capsule");
+    println!("== Cfg (gguf vs capsule) ==");
+    println!("  gguf:    {:?}", hos::qwen35::Cfg::from_gguf(&g).map(|c| format!("{c:?}")));
+    println!("  capsule: {:?}", hos::qwen35::Cfg::from_gguf(&src).map(|c| format!("{c:?}")));
+    let cos = |a: &[f32], b: &[f32]| -> f64 {
+        let n = a.len().min(b.len());
+        let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            d += a[i] as f64 * b[i] as f64;
+            na += (a[i] as f64).powi(2);
+            nb += (b[i] as f64).powi(2);
+        }
+        d / (na.sqrt() * nb.sqrt() + 1e-12)
+    };
+    let mut names: Vec<String> = vec![
+        "token_embd.weight".into(),
+        "output.weight".into(),
+        "output_norm.weight".into(),
+    ];
+    for l in [0usize, 1, 3, 10, 31, 63] {
+        for t in [
+            "attn_norm.weight", "ffn_gate.weight", "ffn_down.weight",
+            "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
+            "ssm_alpha.weight", "ssm_beta.weight", "ssm_a", "ssm_conv1d.weight",
+            "ssm_dt.bias", "ssm_norm.weight",
+            "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+        ] {
+            names.push(format!("blk.{l}.{t}"));
+        }
+    }
+    println!("== tensor cos (capsule vs gguf); only present-in-both compared ==");
+    let mut worst = 1.0f64;
+    let mut worst_name = String::new();
+    for n in &names {
+        if !g.has(n) || !src.has(n) {
+            continue;
+        }
+        let a = g.dequant(n).unwrap_or_default();
+        let b = src.dequant(n).unwrap_or_default();
+        let c = cos(&a, &b);
+        if c < worst {
+            worst = c;
+            worst_name = n.clone();
+        }
+        let flag = if c < 0.9 { "?? MISMATCH" } else { "ok" };
+        let sample = if c < 0.9 && a.len() >= 4 {
+            format!("  gguf[{:.3},{:.3}] cap[{:.3},{:.3}]", a[0], a[1], b[0], b[1])
+        } else {
+            String::new()
+        };
+        println!("  {n:28} n={:<9} cos={c:+.4} {flag}{sample}", a.len());
+    }
+    println!("  worst: {worst_name} cos={worst:+.4}");
 }
 
 fn cmd_run(o: &Opts) {

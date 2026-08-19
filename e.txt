@@ -1,0 +1,4 @@
+[hos] Metal device: Apple M4 Max
+[qwen35] loaded: 64 blocks, vocab 248320 (GPU matmuls)
+[qwen35] MTP draft head loaded (self-speculative decoding available)
+[qwen35] GPU-resident runner ready
