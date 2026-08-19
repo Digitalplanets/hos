@@ -68,7 +68,7 @@ pub struct VisionCfg {
 }
 
 impl VisionCfg {
-    pub fn from_gguf(g: &Gguf) -> Result<VisionCfg> {
+    pub fn from_gguf<S: crate::model::ModelSource>(g: &S) -> Result<VisionCfg> {
         let k = |s: &str| format!("clip.vision.{s}");
         let need = |key: &str| {
             g.meta_u64(&k(key))
@@ -143,7 +143,7 @@ pub struct VisionTower {
 impl VisionTower {
     /// Load every tensor from the mmproj GGUF (BF16 -> f32) and validate the
     /// architecture against the config. Returns an error naming any missing tensor.
-    pub fn load(g: &Gguf) -> Result<VisionTower> {
+    pub fn load<S: crate::model::ModelSource>(g: &S) -> Result<VisionTower> {
         let cfg = VisionCfg::from_gguf(g)?;
         let d = cfg.hidden;
         let get = |name: &str| -> Result<Vec<f32>> { g.dequant(name) };
