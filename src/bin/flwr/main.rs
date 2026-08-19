@@ -190,6 +190,7 @@ fn parse() -> Opts {
 fn main() {
     let o = parse();
     match o.cmd.as_str() {
+        "__cmphf" => cmd_cmphf(&o),
         "run" => cmd_run(&o),
         "serve" => cmd_serve(&o),
         "membench" | "bench-memory" => cmd_membench(&o),
@@ -242,6 +243,79 @@ fn main() {
             usage();
         }
     }
+}
+
+/// `__cmphf <gguf> <hf-dir>`: diagnostic — compare the qwen35 GGUF's tensors
+/// (ground truth) against the HF tensors under our ingest mapping/conversions.
+/// Cosine ~1.0 = the mapping is right (q4_k vs bf16 differ only by quant error);
+/// cosine ~0 = wrong tensor/conversion. Pinpoints which conversion to fix.
+fn cmd_cmphf(o: &Opts) {
+    use hos::model::ModelSource;
+    let gguf = o.model.clone().expect("need gguf");
+    let hf = o.dest.clone().expect("need hf dir");
+    let g = hos::gguf::Gguf::open(std::path::Path::new(&gguf)).expect("open gguf");
+    let st = hos::safetensors::SafeTensors::open_dir(std::path::Path::new(&hf)).expect("open hf");
+    let cos = |a: &[f32], b: &[f32]| -> (f64, f64) {
+        let n = a.len().min(b.len());
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            dot += a[i] as f64 * b[i] as f64;
+            na += (a[i] as f64).powi(2);
+            nb += (b[i] as f64).powi(2);
+        }
+        (dot / (na.sqrt() * nb.sqrt() + 1e-12), (na / n as f64).sqrt())
+    };
+    let mut cmp = |label: &str, gname: &str, hname: &str, conv: fn(f32) -> f32| {
+        let a = match g.dequant(gname) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("  {label:22} GGUF miss {gname}: {e}");
+                return;
+            }
+        };
+        let b: Vec<f32> = match st.to_f32(hname) {
+            Ok(v) => v.into_iter().map(conv).collect(),
+            Err(e) => {
+                println!("  {label:22} HF miss {hname}: {e}");
+                return;
+            }
+        };
+        let (c, rms) = cos(&a, &b);
+        println!(
+            "  {label:22} cos={c:+.4}  (gguf n={} hf n={} rms={rms:.4}) {}",
+            a.len(),
+            b.len(),
+            if c > 0.9 { "OK" } else { "?? MISMATCH" }
+        );
+    };
+    let id = |x: f32| x;
+    let negexp = |x: f32| -(x.exp());
+    let neg = |x: f32| -x;
+    let l0 = "model.language_model.layers.0.linear_attn";
+    let l3 = "model.language_model.layers.3.self_attn";
+    println!("== embeddings / head ==");
+    cmp("token_embd", "token_embd.weight", "model.language_model.embed_tokens.weight", id);
+    cmp("output(lm_head)", "output.weight", "lm_head.weight", id);
+    cmp("output_norm", "output_norm.weight", "model.language_model.norm.weight", id);
+    println!("== full-attn layer 3 (q/k permute test) ==");
+    cmp("attn_q l3", "blk.3.attn_q.weight", &format!("{l3}.q_proj.weight"), id);
+    cmp("attn_k l3", "blk.3.attn_k.weight", &format!("{l3}.k_proj.weight"), id);
+    cmp("attn_v l3", "blk.3.attn_v.weight", &format!("{l3}.v_proj.weight"), id);
+    cmp("attn_out l3", "blk.3.attn_output.weight", &format!("{l3}.o_proj.weight"), id);
+    println!("== ssm layer 0 (a/b order + A_log conversion tests) ==");
+    cmp("attn_qkv l0", "blk.0.attn_qkv.weight", &format!("{l0}.in_proj_qkv.weight"), id);
+    cmp("attn_gate l0", "blk.0.attn_gate.weight", &format!("{l0}.in_proj_z.weight"), id);
+    cmp("ssm_out l0", "blk.0.ssm_out.weight", &format!("{l0}.out_proj.weight"), id);
+    cmp("ssm_alpha=a", "blk.0.ssm_alpha.weight", &format!("{l0}.in_proj_a.weight"), id);
+    cmp("ssm_alpha=b?", "blk.0.ssm_alpha.weight", &format!("{l0}.in_proj_b.weight"), id);
+    cmp("ssm_beta=b", "blk.0.ssm_beta.weight", &format!("{l0}.in_proj_b.weight"), id);
+    cmp("ssm_conv1d", "blk.0.ssm_conv1d.weight", &format!("{l0}.conv1d.weight"), id);
+    cmp("ssm_dt", "blk.0.ssm_dt.bias", &format!("{l0}.dt_bias"), id);
+    cmp("ssm_norm", "blk.0.ssm_norm.weight", &format!("{l0}.norm.weight"), id);
+    println!("== A_log -> ssm_a: try id / -x / -exp(x) ==");
+    cmp("ssm_a = A_log", "blk.0.ssm_a", &format!("{l0}.A_log"), id);
+    cmp("ssm_a = -A_log", "blk.0.ssm_a", &format!("{l0}.A_log"), neg);
+    cmp("ssm_a = -exp(A_log)", "blk.0.ssm_a", &format!("{l0}.A_log"), negexp);
 }
 
 fn cmd_run(o: &Opts) {
