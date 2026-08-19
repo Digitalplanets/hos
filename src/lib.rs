@@ -132,11 +132,18 @@ pub fn sample(
     for p in probs.iter_mut() {
         *p /= sum;
     }
-    // rank by probability, keep top-k then nucleus top-p
+    // rank by probability, keep top-k then nucleus top-p. With a set top_k a full
+    // sort of the whole vocab is wasteful (gemma's vocab is 262k): quickselect the
+    // top_k, then sort only those. Identical kept set, O(vocab) instead of
+    // O(vocab*log vocab) — saves several ms/token on large-vocab models.
+    let cmp = |a: &usize, b: &usize| probs[*b].partial_cmp(&probs[*a]).unwrap();
     let mut idx: Vec<usize> = (0..probs.len()).collect();
-    idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-    if top_k > 0 {
-        idx.truncate(top_k.min(idx.len()));
+    if top_k > 0 && top_k < idx.len() {
+        idx.select_nth_unstable_by(top_k - 1, cmp);
+        idx.truncate(top_k);
+        idx.sort_unstable_by(cmp);
+    } else {
+        idx.sort_unstable_by(cmp);
     }
     if top_p < 1.0 {
         let mut cum = 0.0;
