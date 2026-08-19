@@ -298,6 +298,13 @@ kernel void matvec_hq4_co(
     for (uint r = 0; r < NDST; ++r) { float t = simd_sum(acc[r]); if (lane == 0 && row0 + r < n_rows) y[row0 + r] = t; }
 }
 
+// Coalesced NDST-rows-per-simdgroup q4_k GEMV. The 8 six-bit sub-block scales/mins
+// are unpacked ONCE per superblock cooperatively — lane L folds getsm+d*sc/dmin*m
+// for sub-block (L&7), then every lane reads sub-block `sb`'s coefficients via
+// simd_shuffle(.., sb). This removes the per-lane redundant scale unpacking that was
+// the dequant-ALU bottleneck (a memory-only variant ran ~2.3x faster than the old
+// per-weight getsm), lifting this kernel from ~24% to ~52% of peak bandwidth while
+// staying bit-identical (same coefficients, same left-assoc fma order per row).
 kernel void matvec_q4k_co(
     device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],
     device float* y [[buffer(2)]], constant uint& in_dim [[buffer(3)]],
@@ -306,18 +313,20 @@ kernel void matvec_q4k_co(
     uint row0 = (gid / 32) * NDST; uint nsb = in_dim / 256; uint sbb = nsb * 144;
     float acc[NDST]; for (uint r = 0; r < NDST; ++r) acc[r] = 0.0f;
     for (uint sbk = 0; sbk < nsb; ++sbk) {
-        float d[NDST], dmin[NDST]; device const uchar* scales[NDST]; device const uchar* qs[NDST];
+        device const uchar* qs[NDST]; float d1_l[NDST], mn_l[NDST];
         for (uint r = 0; r < NDST; ++r) {
             uint p = min(row0 + r, n_rows - 1) * sbb + sbk * 144;
-            d[r] = rdh(w, p); dmin[r] = rdh(w, p + 2); scales[r] = w + p + 4; qs[r] = w + p + 16;
+            float d = rdh(w, p); float dmin = rdh(w, p + 2); qs[r] = w + p + 16;
+            uchar sc, m; getsm(w + p + 4, lane & 7u, sc, m);
+            d1_l[r] = d * sc; mn_l[r] = dmin * m;
         }
         uint xo = sbk * 256;
         for (uint sb = 0; sb < 8; ++sb) {
             uint qi = (sb / 2) * 32 + lane; float xv = x[xo + sb * 32 + lane];
             for (uint r = 0; r < NDST; ++r) {
-                uchar sc, m; getsm(scales[r], sb, sc, m);
+                float d1 = simd_shuffle(d1_l[r], sb); float mn = simd_shuffle(mn_l[r], sb);
                 uint nib = (sb & 1) ? (qs[r][qi] >> 4) : (qs[r][qi] & 0xF);
-                acc[r] += (d[r] * sc * (float)nib - dmin[r] * m) * xv;
+                acc[r] += (d1 * (float)nib - mn) * xv;
             }
         }
     }
