@@ -2851,6 +2851,7 @@ impl ChatSession {
         let mut reasoning = think.on;
         let mut answer_started = false;
         let mut n = 0usize;
+        let _t_st = std::time::Instant::now();
         for _ in 0..max_tokens {
             let from = recent.len().saturating_sub(repeat_last_n);
             let next = crate::sample(
@@ -2918,6 +2919,10 @@ impl ChatSession {
             } else {
                 on(Chunk::Answer(&tail));
             }
+        }
+        if std::env::var("HOS_QWEN35_TIMING").is_ok() {
+            let s = _t_st.elapsed().as_secs_f64();
+            eprintln!("[qwen35-timing] {n} tokens in {s:.2}s = {:.1} tok/s (single-token)", n as f64 / s.max(1e-9));
         }
         n
     }
