@@ -4197,6 +4197,8 @@ fn gemma_tok_selftest() -> hos::Result<()> {
 }
 
 fn main() {
+    // the HOS banner, every invocation (stderr: machine-readable stdout stays clean)
+    print_banner();
     if std::env::args().any(|a| a == "--gemma-tok-selftest") {
         if let Err(e) = gemma_tok_selftest() {
             eprintln!("gemma-tok selftest error: {e}");
@@ -4405,7 +4407,6 @@ fn main() {
         }
     }
     let args = parse_args();
-    print_banner();
 
     let model_path = resolve_model(args.model.clone());
     eprintln!("[hos] model: {}", model_path.display());

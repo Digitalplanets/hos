@@ -41,6 +41,7 @@ struct Opts {
     qtype: String,
     awq: bool,
     no_think: bool,
+    think_on: bool,
     effort: Option<String>,
     hide_thinking: bool,
     image: Option<String>,
@@ -48,15 +49,18 @@ struct Opts {
 }
 
 impl Opts {
-    /// Thinking config for hybrid reasoning models (qwen35).
+    /// Thinking config for hybrid reasoning models (qwen35). Default is OFF with
+    /// low effort — a fresh user asking a casual question should get an answer,
+    /// not a 2000-token reasoning trace. `--think` turns it on (low effort unless
+    /// `--effort medium|xhigh`); `--no-think` is still accepted.
     fn think(&self) -> hos::qwen35::Think {
         let effort = self
             .effort
             .as_deref()
             .and_then(hos::qwen35::Effort::parse)
-            .unwrap_or(hos::qwen35::Effort::Xhigh);
+            .unwrap_or(hos::qwen35::Effort::Low);
         hos::qwen35::Think {
-            on: !self.no_think,
+            on: self.think_on && !self.no_think,
             effort,
         }
     }
@@ -126,6 +130,7 @@ fn parse() -> Opts {
         qtype: "q8_0".to_string(),
         awq: false,
         no_think: false,
+        think_on: false,
         effort: None,
         hide_thinking: false,
         image: None,
@@ -163,7 +168,11 @@ fn parse() -> Opts {
             "--gpu" => o.gpu = true,
             "--cpu" => o.gpu = false,
             "--no-think" | "--no-thinking" => o.no_think = true,
-            "--effort" | "--reasoning-effort" => o.effort = it.next(),
+            "--think" | "--thinking" => o.think_on = true,
+            "--effort" | "--reasoning-effort" => {
+                o.effort = it.next();
+                o.think_on = true; // asking for an effort level implies thinking on
+            }
             "--hide-thinking" | "--hide-reasoning" => o.hide_thinking = true,
             "--image" | "--img" => o.image = it.next(),
             "--mmproj" => o.mmproj = it.next(),
