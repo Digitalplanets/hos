@@ -2790,10 +2790,13 @@ pub struct Think {
 }
 
 impl Default for Think {
+    /// Off by default: a fresh user asking a casual question gets an answer,
+    /// not a long reasoning trace. Opt in with `--think` (CLI) or
+    /// `enable_thinking` / `reasoning_effort` (API, web UI).
     fn default() -> Think {
         Think {
-            on: true,
-            effort: Effort::Xhigh,
+            on: false,
+            effort: Effort::Low,
         }
     }
 }

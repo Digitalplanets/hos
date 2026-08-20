@@ -65,21 +65,27 @@ impl Backend {
         rep_penalty: f32,
         repeat_last_n: usize,
         seed: u64,
+        json_mode: bool,
         mut on: impl FnMut(hos::qwen35::Chunk),
     ) -> usize {
         use hos::qwen35::Chunk;
         match self {
-            Backend::Engine(e) => e.chat(
-                msgs,
-                max_tokens,
-                temp,
-                top_k,
-                top_p,
-                rep_penalty,
-                repeat_last_n,
-                seed,
-                |piece| on(Chunk::Answer(piece)),
-            ),
+            Backend::Engine(e) => {
+                e.set_json_mode(json_mode);
+                let n = e.chat(
+                    msgs,
+                    max_tokens,
+                    temp,
+                    top_k,
+                    top_p,
+                    rep_penalty,
+                    repeat_last_n,
+                    seed,
+                    |piece| on(Chunk::Answer(piece)),
+                );
+                e.set_json_mode(false);
+                n
+            }
             Backend::Gemma4 { sess, rng } => {
                 if seed != 0 {
                     *rng = seed;
@@ -183,6 +189,9 @@ struct Params {
     repeat_last_n: usize,
     seed: u64,
     think: hos::qwen35::Think,
+    /// OpenAI `response_format: {"type":"json_object"}` -> JSON-constrained decoding
+    /// (the llama-family engine's grammar constraint; other backends ignore it).
+    json_mode: bool,
     // Conversation-compression knobs (editable from the web settings panel). Ride
     // with each request so no shared mutable server state / env mutation is needed.
     context_tokens: usize,
@@ -204,6 +213,7 @@ impl Default for Params {
             // client that passes `seed` overrides this and gets reproducible output.
             seed: crate::random_seed(),
             think: hos::qwen35::Think::default(),
+            json_mode: false,
             context_tokens: crate::memory::context_budget_tokens(),
             recent_turns: crate::memory::recent_turns(),
             batch_messages: crate::memory::batch_messages(),
@@ -722,6 +732,10 @@ fn parse_chat(body: &[u8]) -> Result<(Vec<Message>, Params, bool, Option<Vec<u8>
     }
     // Reasoning controls (qwen35): OpenAI-style `reasoning_effort`, plus
     // `enable_thinking` (Qwen convention). Ignored by non-reasoning models.
+    // OpenAI `response_format: {"type": "json_object"}` -> constrained JSON decoding
+    if req["response_format"]["type"].as_str() == Some("json_object") {
+        p.json_mode = true;
+    }
     if let Some(v) = req["enable_thinking"].as_bool() {
         p.think.on = v;
     }
@@ -817,6 +831,7 @@ fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::R
             p.rep_penalty,
             p.repeat_last_n,
             p.seed,
+            p.json_mode,
             |chunk| {
                 // Reasoning streams as `reasoning_content` (OpenAI reasoning-model
                 // convention) so the visible `content` stays the clean answer.
@@ -872,6 +887,7 @@ fn run_chat(eng: &mut Backend, model_name: &str, mut job: ChatJob) -> std::io::R
             p.rep_penalty,
             p.repeat_last_n,
             p.seed,
+            p.json_mode,
             |chunk| match chunk {
                 hos::qwen35::Chunk::Reasoning(t) => reasoning.push_str(t),
                 hos::qwen35::Chunk::Answer(t) => text.push_str(t),
@@ -1054,7 +1070,8 @@ const CHAT_HTML: &str = r##"<!doctype html>
       <div class="modelrow"><span class="lbl">MODEL</span><select id="modelsel"></select></div>
       <div class="themebar" id="themebar"><span class="lbl">THEME</span></div>
       <div class="sysrow"><button class="systoggle" id="systoggle">&#9881; instruction</button>
-        <button class="systoggle" id="settoggle">&#9881; settings</button></div>
+        <button class="systoggle" id="settoggle">&#9881; settings</button>
+        <button class="systoggle" id="thinktoggle" title="reasoning models: show their thinking (off / low / medium / xhigh)">&#128173; think: off</button></div>
       <textarea id="sys" class="sysbox" placeholder="Optional: give the model a role or a core instruction. It persists for this conversation."></textarea>
       <div id="settings" class="settings">
         <div class="grp">sampling</div>
@@ -1212,6 +1229,16 @@ function settingsBody(){
 }
 setToggle.onclick=()=>{ const on=setPanel.classList.toggle('show'); setToggle.classList.toggle('on',on); };
 loadSettings();
+// ---- thinking: visible toggle, same default as the CLI (off); cycles off -> low -> medium -> xhigh ----
+const THINK_LEVELS=['off','low','medium','xhigh'];
+const thinkBtn=document.getElementById('thinktoggle');
+let thinkLevel=localStorage.getItem('flwr-think')||'off'; if(!THINK_LEVELS.includes(thinkLevel)) thinkLevel='off';
+function paintThink(){ thinkBtn.innerHTML='&#128173; think: '+thinkLevel; thinkBtn.classList.toggle('on',thinkLevel!=='off'); }
+thinkBtn.onclick=()=>{ thinkLevel=THINK_LEVELS[(THINK_LEVELS.indexOf(thinkLevel)+1)%THINK_LEVELS.length];
+  try{ localStorage.setItem('flwr-think',thinkLevel); }catch(e){} paintThink(); };
+paintThink();
+const _settingsBody=settingsBody;
+settingsBody=function(){ const b=_settingsBody(); b.enable_thinking=(thinkLevel!=='off'); if(thinkLevel!=='off') b.reasoning_effort=thinkLevel; return b; };
 sysBox.addEventListener('input',()=>setSystem(sysBox.value));
 
 // ---- saved chats (provenance-bearing transcripts on the server) ----

@@ -832,6 +832,11 @@ kernel void add_rmsnorm(
     float scale = 1.0f / sqrt(partial[0] / float(n) + eps);
     for (uint i = tid; i < n; i += tcount) xb[i] = x[i] * scale * w[i];
 }
+// y[t*dim + i] += b[i] for ntok rows (attention biases in the batched prefill)
+kernel void add_bias_rows(
+    device float* y [[buffer(0)]], device const float* b [[buffer(1)]],
+    constant uint& dim [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) { y[gid] += b[gid % dim]; }
 kernel void rmsnorm(
     device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
     device float* out [[buffer(2)]], constant uint& n [[buffer(3)]],
@@ -3218,6 +3223,8 @@ pub struct GpuRunner {
     p_mm_q4k_batch: ComputePipelineState,
     p_mm_q4k_prefill: ComputePipelineState,
     p_dequant_q4k: ComputePipelineState,
+    p_dequant_q6k: ComputePipelineState,
+    p_add_bias_rows: ComputePipelineState,
     p_mm_abt_tiled: ComputePipelineState,
     p_mm_abt_reg: ComputePipelineState,
     p_rmsnorm_batch: ComputePipelineState,
@@ -3329,6 +3336,8 @@ impl GpuRunner {
             p_mm_q4k_batch: pipeline(&device, &lib, "matmul_q4k_batch"),
             p_mm_q4k_prefill: pipeline(&device, &lib, "matmul_q4k_prefill"),
             p_dequant_q4k: pipeline(&device, &lib, "dequant_q4k_to_f32"),
+            p_dequant_q6k: pipeline(&device, &lib, "dequant_q6k_to_f32"),
+            p_add_bias_rows: pipeline(&device, &lib, "add_bias_rows"),
             p_mm_abt_tiled: pipeline(&device, &lib, "matmul_abt_tiled"),
             p_mm_abt_reg: pipeline(&device, &lib, "matmul_abt_reg"),
             p_rmsnorm_batch: pipeline(&device, &lib, "rmsnorm_batch"),
@@ -3394,6 +3403,20 @@ impl GpuRunner {
         x: &BufferRef,
         y: &BufferRef,
     ) {
+        self.enc_matvec_off(enc, w, x, 0, y, 0)
+    }
+
+    /// `enc_matvec` with byte offsets into `x` and `y` (one token's row of a
+    /// batched activation buffer).
+    fn enc_matvec_off(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuMatrix,
+        x: &BufferRef,
+        xoff: u64,
+        y: &BufferRef,
+        yoff: u64,
+    ) {
         let in_dim = w.in_dim as u32;
         // coalesced kernels use a 32-lane simdgroup per row; scalar kernels use 1 thread/row
         let (p, coalesced) = match w.ggml_type {
@@ -3419,8 +3442,8 @@ impl GpuRunner {
         };
         enc.set_compute_pipeline_state(p);
         enc.set_buffer(0, Some(&w.buf), 0);
-        enc.set_buffer(1, Some(x), 0);
-        enc.set_buffer(2, Some(y), 0);
+        enc.set_buffer(1, Some(x), xoff);
+        enc.set_buffer(2, Some(y), yoff);
         enc.set_bytes(3, 4, &in_dim as *const u32 as *const c_void);
         if coalesced {
             // coalesced kernels process 2 rows per 32-lane simdgroup (4 for v5 q4_k).
@@ -3703,14 +3726,19 @@ impl GpuRunner {
     /// True if this model can use the batched-prefill path: all projection weights
     /// are q4_k (the one batched matmul kernel) and there are no attention biases.
     fn can_batch(&self, model: &Model) -> bool {
-        self.bq.iter().all(Option::is_none)
-            && self.bk.iter().all(Option::is_none)
-            && self.bv.iter().all(Option::is_none)
-            && model.layers.iter().all(|l| {
-                [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down]
-                    .iter()
-                    .all(|w| w.as_gpu().ggml_type == GGML_Q4_K)
-            })
+        // Every projection must have a batched path: q4_k natively, q6_k (the
+        // Q4_K_M mix) through dequant-to-scratch + tiled GEMM. Attention biases
+        // (Qwen2) are added in-path with add_bias_rows.
+        model.layers.iter().all(|l| {
+            [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down]
+                .iter()
+                .all(|w| matches!(w.as_gpu().ggml_type, GGML_Q4_K | GGML_Q6_K))
+        })
+    }
+
+    /// Largest prompt chunk the batched prefill takes in one pass.
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
     }
 
     /// Batched q4_k projection Y[ntok,n_rows] = X[ntok,in_dim] @ W^T, in tiles of
@@ -3724,10 +3752,27 @@ impl GpuRunner {
         ntok: usize,
     ) {
         let (in_dim, n_rows, nt) = (w.in_dim as u32, w.n_rows as u32, ntok as u32);
+        let small = ntok < 48 || std::env::var("HOS_PREFILL").as_deref() == Ok("old");
+        if w.ggml_type != GGML_Q4_K && small {
+            // q6_k/q8_0/q5_0 tensors of a mixed quant on a tiny prompt: per-token
+            // coalesced matvec (the weight is re-read per token, but these are a
+            // minority of tensors and the prompt is short).
+            for t in 0..ntok {
+                self.enc_matvec_off(
+                    enc,
+                    w,
+                    x,
+                    (t * w.in_dim * 4) as u64,
+                    y,
+                    (t * w.n_rows * 4) as u64,
+                );
+            }
+            return;
+        }
         // Tiny prompts: the old dequant-into-shared kernel wins (the tiled GEMM's
         // fixed dequant-to-scratch cost isn't yet amortized). Crossover ~pp48 on
         // 1B; above it the tiled GEMM scales 2-3x better. HOS_PREFILL=old forces it.
-        if ntok < 48 || std::env::var("HOS_PREFILL").as_deref() == Ok("old") {
+        if small {
             if w.in_dim <= 4096 {
                 enc.set_compute_pipeline_state(&self.p_mm_q4k_prefill);
                 enc.set_buffer(0, Some(&w.buf), 0);
@@ -3762,7 +3807,10 @@ impl GpuRunner {
             return;
         }
         // 1. dequant the whole weight to f32 scratch ONCE (amortized over all tokens).
-        enc.set_compute_pipeline_state(&self.p_dequant_q4k);
+        enc.set_compute_pipeline_state(match w.ggml_type {
+            GGML_Q6_K => &self.p_dequant_q6k,
+            _ => &self.p_dequant_q4k,
+        });
         enc.set_buffer(0, Some(&w.buf), 0);
         enc.set_buffer(1, Some(&self.wdq), 0);
         enc.set_bytes(2, 4, &in_dim as *const u32 as *const c_void);
@@ -3993,6 +4041,32 @@ impl GpuRunner {
             self.enc_mm_q4k_batch(enc, layer.wk.as_gpu(), &self.xb_batch, &self.k_batch, n);
             self.enc_mm_q4k_batch(enc, layer.wv.as_gpu(), &self.xb_batch, &self.v_batch, n);
             Self::barrier(enc, &[&self.q_batch, &self.k_batch, &self.v_batch]);
+            // attention biases (Qwen2-family): one row-broadcast add per projection
+            {
+                let q_dim = cfg.n_heads * hd;
+                let mut biased = false;
+                for (buf, bias, width) in [
+                    (&self.q_batch, &self.bq[l], q_dim),
+                    (&self.k_batch, &self.bk[l], kv_dim),
+                    (&self.v_batch, &self.bv[l], kv_dim),
+                ] {
+                    if let Some(b) = bias {
+                        let d = width as u32;
+                        enc.set_compute_pipeline_state(&self.p_add_bias_rows);
+                        enc.set_buffer(0, Some(buf), 0);
+                        enc.set_buffer(1, Some(b), 0);
+                        enc.set_bytes(2, 4, &d as *const u32 as *const c_void);
+                        enc.dispatch_threads(
+                            MTLSize::new((n * width) as u64, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                        biased = true;
+                    }
+                }
+                if biased {
+                    Self::barrier(enc, &[&self.q_batch, &self.k_batch, &self.v_batch]);
+                }
+            }
             self.enc_rope_batch(
                 enc,
                 &self.q_batch,

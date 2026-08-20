@@ -347,9 +347,26 @@ impl Engine {
             if let Some(r) = self.runner.as_ref() {
                 // batched prefill: ingest the whole prompt in one pass, reusing each
                 // weight read across all tokens. Falls back if the model isn't eligible.
-                if let Some(logits) = r.forward_prefill_gpu(&self.model, ids, self.pos) {
-                    self.pos += ids.len();
-                    return logits;
+                // Long prompts go through in max_batch-sized chunks (each chunk
+                // fills the KV cache; only the last chunk's logits are needed).
+                let mb = r.max_batch().max(1);
+                let mut pos = self.pos;
+                let mut logits: Option<Vec<f32>> = None;
+                for chunk in ids.chunks(mb) {
+                    match r.forward_prefill_gpu(&self.model, chunk, pos) {
+                        Some(l) => {
+                            logits = Some(l);
+                            pos += chunk.len();
+                        }
+                        None => {
+                            logits = None;
+                            break;
+                        }
+                    }
+                }
+                if let Some(l) = logits {
+                    self.pos = pos;
+                    return l;
                 }
                 let mut pos = self.pos;
                 let mut logits = Vec::new();
