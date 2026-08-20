@@ -382,6 +382,5 @@ Embed the engine in your own Rust program: `use hos::...`. The API surface
 | [LIBRARY.md](LIBRARY.md) | Embeddable library API. |
 | [FINETUNING.md](FINETUNING.md) | Fine-tuning and training workflow. |
 | [EXPLAINER.md](EXPLAINER.md) / [DIAGRAM.md](DIAGRAM.md) | Conceptual overview and diagrams. |
-| [EVAL.md](../EVAL.md) | Evaluation methodology and results. |
 </content>
 </invoke>
