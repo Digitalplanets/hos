@@ -2382,7 +2382,7 @@ mod resident {
             eprintln!("[gemma4] GPU-resident decoder ready");
             Gemma4Gpu {
                 p_mv_f16: pl("matvec_f16"),
-                p_mv_q4k: pl("matvec_q4k_co"),
+                p_mv_q4k: pl(crate::metal_be::q4k_gemv_name()),
                 p_mv_q5k: pl("matvec_q5k_co"),
                 p_mv_q6k: pl("matvec_q6k_co"),
                 p_mv_q8: pl("matvec_q8_0_co"),
@@ -2456,9 +2456,13 @@ mod resident {
             enc.set_buffer(2, Some(y), 0);
             Self::set_u(enc, 3, w.in_dim as u32);
             if co {
-                const NDST: u64 = 2;
+                let ndst: u64 = if w.ggml_type == GGML_Q4_K {
+                    crate::metal_be::q4k_ndst()
+                } else {
+                    2
+                };
                 Self::set_u(enc, 4, w.n_rows as u32);
-                let sg = (w.n_rows as u64).div_ceil(NDST);
+                let sg = (w.n_rows as u64).div_ceil(ndst);
                 enc.dispatch_threads(MTLSize::new(sg * 32, 1, 1), MTLSize::new(32, 1, 1));
             } else {
                 enc.dispatch_threads(

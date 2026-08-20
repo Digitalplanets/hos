@@ -28,6 +28,20 @@ pub type GpuBuf = metal::Buffer;
 /// Read the first `n` f32s of a resident buffer back to CPU. Apple Silicon is
 /// unified memory, so this is a direct read of the shared buffer (the GPU write
 /// that produced it already completed), not a device copy.
+/// q4_k GEMV selection for every runner: the v5 kernel (16-byte loads, 4 rows
+/// per simdgroup, ~26% more sustained bandwidth) by default; HOS_GEMV=old picks
+/// the original matvec_q4k_co (2 rows/simdgroup).
+pub(crate) fn q4k_gemv_old() -> bool {
+    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OLD.get_or_init(|| std::env::var("HOS_GEMV").as_deref() == Ok("old"))
+}
+pub(crate) fn q4k_gemv_name() -> &'static str {
+    if q4k_gemv_old() { "matvec_q4k_co" } else { "matvec_q4k_co_v5" }
+}
+pub(crate) fn q4k_ndst() -> u64 {
+    if q4k_gemv_old() { 2 } else { 4 }
+}
+
 pub fn download_buf(buf: &GpuBuf, n: usize) -> Vec<f32> {
     unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, n) }.to_vec()
 }
@@ -643,6 +657,181 @@ kernel void matmul_q6k_co2(
 }
 
 // one threadgroup of 256 threads; out = x/sqrt(mean(x^2)+eps) * w
+// v5 q4_k GEMV for the qwen35 resident runner: 16-byte qs loads per lane,
+// 4 superblocks in flight (8 lanes each), 4 rows per simdgroup. ~26% more
+// sustained bandwidth than matvec_q4k_co (409 vs 324 GB/s isolated on M4 Max).
+// Lane partial sums are associated differently than matvec_q4k_co, so results
+// can differ in the last bits (validated against the CPU q4_k decode within
+// 1e-4 relative). matvec_q4k_co stays for its other consumers.
+kernel void matvec_q4k_co_v5(
+    device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]], constant uint& in_dim [[buffer(3)]],
+    constant uint& n_rows [[buffer(4)]],
+    uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = (gid / 32) * 4; uint nsb = in_dim / 256; uint sbb = nsb * 144;
+    uint ix = lane / 8;      // which of 4 concurrent superblocks
+    uint it = lane % 8;      // 16-byte chunk of the 128B qs
+    uint c  = it / 2;        // 32-byte chunk -> sub-block pair 2c/2c+1
+    uint o16 = (it % 2) * 16;
+    uint rbase[4];
+    for (uint r = 0; r < 4; ++r) rbase[r] = min(row0 + r, n_rows - 1) * sbb;
+    float acc[4]; for (uint r = 0; r < 4; ++r) acc[r] = 0.0f;
+    for (uint sbk = ix; sbk < nsb; sbk += 4) {
+        uint xo = sbk * 256 + c * 64 + o16;
+        float4 xa0 = *(device const float4*)(x + xo);
+        float4 xa1 = *(device const float4*)(x + xo + 4);
+        float4 xa2 = *(device const float4*)(x + xo + 8);
+        float4 xa3 = *(device const float4*)(x + xo + 12);
+        float4 xb0 = *(device const float4*)(x + xo + 32);
+        float4 xb1 = *(device const float4*)(x + xo + 36);
+        float4 xb2 = *(device const float4*)(x + xo + 40);
+        float4 xb3 = *(device const float4*)(x + xo + 44);
+        for (uint r = 0; r < 4; ++r) {
+            uint p = rbase[r] + sbk * 144;
+            float d = rdh(w, p); float dmin = rdh(w, p + 2);
+            uchar s0c, m0c, s1c, m1c;
+            getsm(w + p + 4, 2 * c, s0c, m0c);
+            getsm(w + p + 4, 2 * c + 1, s1c, m1c);
+            float d1a = d * s0c, mna = dmin * m0c;
+            float d1b = d * s1c, mnb = dmin * m1c;
+            uint4 q4 = *(device const uint4*)(w + p + 16 + 16 * it);
+            float s = 0.0f;
+            uint q;
+            q = q4.x;
+            s += (d1a * (float)(q & 0xF) - mna) * xa0.x;
+            s += (d1a * (float)((q >> 8) & 0xF) - mna) * xa0.y;
+            s += (d1a * (float)((q >> 16) & 0xF) - mna) * xa0.z;
+            s += (d1a * (float)((q >> 24) & 0xF) - mna) * xa0.w;
+            s += (d1b * (float)((q >> 4) & 0xF) - mnb) * xb0.x;
+            s += (d1b * (float)((q >> 12) & 0xF) - mnb) * xb0.y;
+            s += (d1b * (float)((q >> 20) & 0xF) - mnb) * xb0.z;
+            s += (d1b * (float)((q >> 28) & 0xF) - mnb) * xb0.w;
+            q = q4.y;
+            s += (d1a * (float)(q & 0xF) - mna) * xa1.x;
+            s += (d1a * (float)((q >> 8) & 0xF) - mna) * xa1.y;
+            s += (d1a * (float)((q >> 16) & 0xF) - mna) * xa1.z;
+            s += (d1a * (float)((q >> 24) & 0xF) - mna) * xa1.w;
+            s += (d1b * (float)((q >> 4) & 0xF) - mnb) * xb1.x;
+            s += (d1b * (float)((q >> 12) & 0xF) - mnb) * xb1.y;
+            s += (d1b * (float)((q >> 20) & 0xF) - mnb) * xb1.z;
+            s += (d1b * (float)((q >> 28) & 0xF) - mnb) * xb1.w;
+            q = q4.z;
+            s += (d1a * (float)(q & 0xF) - mna) * xa2.x;
+            s += (d1a * (float)((q >> 8) & 0xF) - mna) * xa2.y;
+            s += (d1a * (float)((q >> 16) & 0xF) - mna) * xa2.z;
+            s += (d1a * (float)((q >> 24) & 0xF) - mna) * xa2.w;
+            s += (d1b * (float)((q >> 4) & 0xF) - mnb) * xb2.x;
+            s += (d1b * (float)((q >> 12) & 0xF) - mnb) * xb2.y;
+            s += (d1b * (float)((q >> 20) & 0xF) - mnb) * xb2.z;
+            s += (d1b * (float)((q >> 28) & 0xF) - mnb) * xb2.w;
+            q = q4.w;
+            s += (d1a * (float)(q & 0xF) - mna) * xa3.x;
+            s += (d1a * (float)((q >> 8) & 0xF) - mna) * xa3.y;
+            s += (d1a * (float)((q >> 16) & 0xF) - mna) * xa3.z;
+            s += (d1a * (float)((q >> 24) & 0xF) - mna) * xa3.w;
+            s += (d1b * (float)((q >> 4) & 0xF) - mnb) * xb3.x;
+            s += (d1b * (float)((q >> 12) & 0xF) - mnb) * xb3.y;
+            s += (d1b * (float)((q >> 20) & 0xF) - mnb) * xb3.z;
+            s += (d1b * (float)((q >> 28) & 0xF) - mnb) * xb3.w;
+            acc[r] += s;
+        }
+    }
+    for (uint r = 0; r < 4; ++r) { float t2 = simd_sum(acc[r]); if (lane == 0 && row0 + r < n_rows) y[row0 + r] = t2; }
+}
+// 2-token q4_k GEMV for the MTP verify (v5 family): 16-byte qs loads, 4
+// superblocks in flight, 4 rows per simdgroup, word-major inner loop so x is
+// loaded once per q-word and each weight is dequantized ONCE for both tokens
+// (X = [x_t | x_d] with in_dim stride, Y likewise with n_rows stride).
+// 2 tokens for ~1.06x a single matvec's cost (385 GB/s isolated at ffn size)
+// vs 2.05x for matmul_q4k_co2, which stays as the HOS_GEMV=old fallback.
+// Same reassociation note as matvec_q4k_co_v5.
+kernel void matmul_q4k_co2_v5(
+    device const uchar* w [[buffer(0)]], device const float* X [[buffer(1)]],
+    device float* Y [[buffer(2)]], constant uint& in_dim [[buffer(3)]],
+    constant uint& n_rows [[buffer(4)]],
+    uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = (gid / 32) * 4; uint nsb = in_dim / 256; uint sbb = nsb * 144;
+    uint ix = lane / 8;
+    uint it = lane % 8;
+    uint c  = it / 2;
+    uint o16 = (it % 2) * 16;
+    uint rbase[4];
+    for (uint r = 0; r < 4; ++r) rbase[r] = min(row0 + r, n_rows - 1) * sbb;
+    float a0[4], a1[4];
+    for (uint r = 0; r < 4; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; }
+    for (uint sbk = ix; sbk < nsb; sbk += 4) {
+        uint xo = sbk * 256 + c * 64 + o16;
+        uint4 q4[4]; float d1a[4], mna[4], d1b[4], mnb[4];
+        for (uint r = 0; r < 4; ++r) {
+            uint p = rbase[r] + sbk * 144;
+            float d = rdh(w, p); float dmin = rdh(w, p + 2);
+            uchar s0c, m0c, s1c, m1c;
+            getsm(w + p + 4, 2 * c, s0c, m0c);
+            getsm(w + p + 4, 2 * c + 1, s1c, m1c);
+            d1a[r] = d * s0c; mna[r] = dmin * m0c;
+            d1b[r] = d * s1c; mnb[r] = dmin * m1c;
+            q4[r] = *(device const uint4*)(w + p + 16 + 16 * it);
+        }
+        for (uint j = 0; j < 4; ++j) {
+            uint xj = xo + j * 4;
+            float4 xa = *(device const float4*)(X + xj);
+            float4 xb = *(device const float4*)(X + xj + 32);
+            float4 ya = *(device const float4*)(X + in_dim + xj);
+            float4 yb = *(device const float4*)(X + in_dim + xj + 32);
+            for (uint r = 0; r < 4; ++r) {
+                uint q = j == 0 ? q4[r].x : (j == 1 ? q4[r].y : (j == 2 ? q4[r].z : q4[r].w));
+                float wv;
+                wv = d1a[r] * (float)(q & 0xF) - mna[r];         a0[r] += wv * xa.x; a1[r] += wv * ya.x;
+                wv = d1a[r] * (float)((q >> 8) & 0xF) - mna[r];  a0[r] += wv * xa.y; a1[r] += wv * ya.y;
+                wv = d1a[r] * (float)((q >> 16) & 0xF) - mna[r]; a0[r] += wv * xa.z; a1[r] += wv * ya.z;
+                wv = d1a[r] * (float)((q >> 24) & 0xF) - mna[r]; a0[r] += wv * xa.w; a1[r] += wv * ya.w;
+                wv = d1b[r] * (float)((q >> 4) & 0xF) - mnb[r];  a0[r] += wv * xb.x; a1[r] += wv * yb.x;
+                wv = d1b[r] * (float)((q >> 12) & 0xF) - mnb[r]; a0[r] += wv * xb.y; a1[r] += wv * yb.y;
+                wv = d1b[r] * (float)((q >> 20) & 0xF) - mnb[r]; a0[r] += wv * xb.z; a1[r] += wv * yb.z;
+                wv = d1b[r] * (float)((q >> 28) & 0xF) - mnb[r]; a0[r] += wv * xb.w; a1[r] += wv * yb.w;
+            }
+        }
+    }
+    for (uint r = 0; r < 4; ++r) {
+        float t0 = simd_sum(a0[r]); float t1 = simd_sum(a1[r]);
+        if (lane == 0 && row0 + r < n_rows) { Y[row0 + r] = t0; Y[n_rows + row0 + r] = t1; }
+    }
+}
+// Coalesced f16 matvec: one 32-lane simdgroup per row. The scalar matvec_f16
+// (kept above, other runners use it) serializes the whole row per thread and
+// tail-stretched any dispatch level containing a small f16 matvec (qwen35's
+// 48-row ssm_beta/ssm_alpha). Lane partials combine via simd_sum, so results
+// differ from the scalar kernel only in float association of the dot.
+kernel void matvec_f16_co(
+    device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]], constant uint& in_dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = gid / 32; uint base = row * in_dim * 2; float acc = 0.0f;
+    for (uint i = lane; i < in_dim; i += 32) acc += rdh(w, base + i * 2) * x[i];
+    float t = simd_sum(acc);
+    if (lane == 0) y[row] = t;
+}
+// Residual add + full rmsnorm in ONE dispatch: x += y, then xb = rmsnorm(x, w).
+// Single threadgroup; the strided partial + tree reduction and the final
+// x[i]*scale*w[i] are copied verbatim from add_inplace + rmsnorm, so the result
+// is bit-identical to that pair while removing one dispatch + barrier level.
+kernel void add_rmsnorm(
+    device float* x [[buffer(0)]], device const float* y [[buffer(1)]],
+    device const float* w [[buffer(2)]], device float* xb [[buffer(3)]],
+    constant uint& n [[buffer(4)]], constant float& eps [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]], uint tcount [[threads_per_threadgroup]]) {
+    threadgroup float partial[256];
+    float ss = 0.0f;
+    for (uint i = tid; i < n; i += tcount) { float v = x[i] + y[i]; x[i] = v; ss += v * v; }
+    partial[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tcount / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = 1.0f / sqrt(partial[0] / float(n) + eps);
+    for (uint i = tid; i < n; i += tcount) xb[i] = x[i] * scale * w[i];
+}
 kernel void rmsnorm(
     device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
     device float* out [[buffer(2)]], constant uint& n [[buffer(3)]],
@@ -1445,6 +1634,69 @@ kernel void rmsnorm_heads(
 }
 
 // per-head L2 normalize in place (x / sqrt(sumsq + eps))
+// deltanet_multi with its per-token neighbours fused in: sigmoid(beta) [==
+// sigmoid_inplace], the decay transform [== ssm_decay], the q/k group l2 norms
+// [== l2norm_heads], and the gated output norm [== gated_norm]. Every op keeps
+// the float sequence and reduction shape of the standalone kernels (valid when
+// hv == threadgroup size and hk == hv, i.e. 128/128 — the caller checks), so
+// results are bit-identical while five dispatch+barrier levels become one.
+// Reads beta/alpha RAW (pre-sigmoid / pre-decay) and conv_out RAW (pre-l2).
+kernel void deltanet_fused(
+    device float* S [[buffer(0)]], device const float* q [[buffer(1)]],
+    device const float* k [[buffer(2)]], device const float* v [[buffer(3)]],
+    device const float* alpha [[buffer(4)]], device const float* beta_r [[buffer(5)]],
+    device float* o [[buffer(6)]],
+    constant uint& hv [[buffer(7)]], constant uint& hk [[buffer(8)]],
+    constant uint& nk [[buffer(9)]], constant float& qscale [[buffer(10)]],
+    device const float* a [[buffer(11)]], device const float* dt [[buffer(12)]],
+    device const float* nw [[buffer(13)]], device const float* z [[buffer(14)]],
+    constant float& eps [[buffer(15)]],
+    uint h [[threadgroup_position_in_grid]], uint j [[thread_position_in_threadgroup]]) {
+    threadgroup float dsh[256];
+    threadgroup float red[256];
+    uint kh = h % nk;
+    device float* Sh = S + h * hv * hv;
+    device const float* qh = q + kh * hk;
+    device const float* kh2 = k + kh * hk;
+    device const float* vh = v + h * hv;
+    // decay transform (ssm_decay) then g, and the beta sigmoid (sigmoid_inplace)
+    float zd = alpha[h] + dt[h];
+    float sp = zd > 20.0f ? zd : log(1.0f + exp(zd));
+    float g = exp(a[h] * sp);
+    float b = 1.0f / (1.0f + exp(-beta_r[h]));
+    // q group l2 scale (l2norm_heads, tcount == hk)
+    float s0 = 0.0f;
+    for (uint i = j; i < hk; i += hv) { float vv = qh[i]; s0 += vv * vv; }
+    red[j] = s0; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = hv / 2; st > 0; st >>= 1) { if (j < st) red[j] += red[j + st]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float qsc = 1.0f / sqrt(red[0] + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // k group l2 scale
+    s0 = 0.0f;
+    for (uint i = j; i < hk; i += hv) { float vv = kh2[i]; s0 += vv * vv; }
+    red[j] = s0; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = hv / 2; st > 0; st >>= 1) { if (j < st) red[j] += red[j + st]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float ksc = 1.0f / sqrt(red[0] + eps);
+    // deltanet body on the normalized values (bit-equal to the stored ones)
+    float kq = 0.0f;
+    for (uint i = 0; i < hk; ++i) kq += (kh2[i] * ksc) * ((qh[i] * qsc) * qscale);
+    float sk = 0.0f, sq = 0.0f;
+    for (uint i = 0; i < hk; ++i) {
+        float s = Sh[j * hv + i] * g; Sh[j * hv + i] = s;
+        sk += s * (kh2[i] * ksc); sq += s * ((qh[i] * qsc) * qscale);
+    }
+    float dj = b * (vh[j] - sk);
+    float oj = sq + dj * kq;
+    dsh[j] = dj; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float kj = kh2[j] * ksc;
+    for (uint i = 0; i < hv; ++i) Sh[i * hv + j] += dsh[i] * kj;
+    // gated norm (gated_norm, tcount == hv)
+    red[j] = oj * oj; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = hv / 2; st > 0; st >>= 1) { if (j < st) red[j] += red[j + st]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float scale = 1.0f / sqrt(red[0] / float(hv) + eps);
+    float zv = z[h * hv + j];
+    o[h * hv + j] = (oj * scale * nw[j]) * (zv / (1.0f + exp(-zv)));
+}
 kernel void l2norm_heads(
     device float* x [[buffer(0)]], constant uint& hd [[buffer(1)]], constant float& eps [[buffer(2)]],
     uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
@@ -1697,7 +1949,7 @@ impl Gpu {
             .expect("compile fused MSL");
         // Coalesced K-quant matvec pipelines (for a natively-quantized GpuMatrix).
         let mut quant_mv = HashMap::new();
-        quant_mv.insert(GGML_Q4_K, pipeline(&device, &lib2, "matvec_q4k_co"));
+        quant_mv.insert(GGML_Q4_K, pipeline(&device, &lib2, q4k_gemv_name()));
         quant_mv.insert(GGML_Q5_K, pipeline(&device, &lib2, "matvec_q5k_co"));
         quant_mv.insert(GGML_Q6_K, pipeline(&device, &lib2, "matvec_q6k_co"));
         quant_mv.insert(GGML_Q8_0, pipeline(&device, &lib2, "matvec_q8_0_co"));
@@ -2873,8 +3125,8 @@ impl Gpu {
             enc.set_buffer(2, Some(&self.y_buf), 0);
             enc.set_bytes(3, 4, &in_dim as *const u32 as *const c_void);
             enc.set_bytes(4, 4, &n_rows as *const u32 as *const c_void);
-            const NDST: u64 = 2;
-            let simdgroups = (w.n_rows as u64).div_ceil(NDST);
+            let ndst: u64 = if w.ggml_type == GGML_Q4_K { q4k_ndst() } else { 2 };
+            let simdgroups = (w.n_rows as u64).div_ceil(ndst);
             enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(32, 1, 1));
         }
         enc.end_encoding();
@@ -3065,7 +3317,7 @@ impl GpuRunner {
             p_mv_q4_0: pipeline(&device, &lib, "matvec_q4_0_co"),
             p_mv_hq4: pipeline(&device, &lib, "matvec_hq4_co"),
             p_mv_q5_0: pipeline(&device, &lib, "matvec_q5_0"),
-            p_mv_q4k: pipeline(&device, &lib, "matvec_q4k_co"),
+            p_mv_q4k: pipeline(&device, &lib, q4k_gemv_name()),
             p_mv_q5k: pipeline(&device, &lib, "matvec_q5k_co"),
             p_mv_q6k: pipeline(&device, &lib, "matvec_q6k_co"),
             p_rmsnorm: pipeline(&device, &lib, "rmsnorm"),
@@ -3171,11 +3423,11 @@ impl GpuRunner {
         enc.set_buffer(2, Some(y), 0);
         enc.set_bytes(3, 4, &in_dim as *const u32 as *const c_void);
         if coalesced {
-            // coalesced kernels process NDST rows per 32-lane simdgroup.
-            const NDST: u64 = 2;
+            // coalesced kernels process 2 rows per 32-lane simdgroup (4 for v5 q4_k).
+            let ndst: u64 = if w.ggml_type == GGML_Q4_K { q4k_ndst() } else { 2 };
             let n_rows = w.n_rows as u32;
             enc.set_bytes(4, 4, &n_rows as *const u32 as *const c_void);
-            let simdgroups = (w.n_rows as u64).div_ceil(NDST);
+            let simdgroups = (w.n_rows as u64).div_ceil(ndst);
             enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(32, 1, 1));
         } else {
             let tg = p.max_total_threads_per_threadgroup().min(256);

@@ -1312,9 +1312,16 @@ impl Qwen35 {
         let mut emitted = 0usize;
         let mut verifies = 0usize;
         let mut accepts = 0usize;
+        // HOS_MTP_TIMING=1: per-phase wall-time breakdown of the sweep loop
+        let timing = std::env::var("HOS_MTP_TIMING").is_ok();
+        let (mut t_draft, mut t_fwd2, mut t_head, mut t_restore, mut t_sample) =
+            (0f64, 0f64, 0f64, 0f64, 0f64);
+        let clk = std::time::Instant::now;
         while emitted < max_tokens {
             let from = recent.len().saturating_sub(repeat_last_n);
+            let t0 = clk();
             let t = crate::sample(&logits, temp, top_k, top_p, rep_penalty, &recent[from..], &mut rng);
+            t_sample += t0.elapsed().as_secs_f64();
             if stops.contains(&t) {
                 break;
             }
@@ -1324,14 +1331,22 @@ impl Qwen35 {
                 break;
             }
             let p = st.pos;
+            let t0 = clk();
             let draft = argmax(&self.mtp_draft(&hidden, t, p, st, gpu));
+            t_draft += t0.elapsed().as_secs_f64();
             // Resident 2-token verify: [t @ p, draft @ p+1] in one command buffer,
             // snapshotting conv/SSM after t for zero-cost rejection.
+            let t0 = clk();
             let hids = rgpu.forward2(self, t, draft, p);
+            t_fwd2 += t0.elapsed().as_secs_f64();
+            let t0 = clk();
             let logits_t = self.head(&hids[0..d], gpu);
+            t_head += t0.elapsed().as_secs_f64();
             let from2 = recent.len().saturating_sub(repeat_last_n);
+            let t0 = clk();
             let real =
                 crate::sample(&logits_t, temp, top_k, top_p, rep_penalty, &recent[from2..], &mut rng);
+            t_sample += t0.elapsed().as_secs_f64();
             verifies += 1;
             if real == draft {
                 accepts += 1;
@@ -1341,14 +1356,26 @@ impl Qwen35 {
                 if stops.contains(&draft) || on(draft) {
                     break;
                 }
+                let t0 = clk();
                 logits = self.head(&hids[d..2 * d], gpu);
+                t_head += t0.elapsed().as_secs_f64();
                 hidden = hids[d..2 * d].to_vec();
             } else {
+                let t0 = clk();
                 rgpu.restore_snap(self);
+                t_restore += t0.elapsed().as_secs_f64();
                 hidden = hids[0..d].to_vec();
                 logits = logits_t;
                 st.pos = p + 1;
             }
+        }
+        if timing && verifies > 0 {
+            let v = verifies as f64;
+            eprintln!(
+                "[mtp-timing] per sweep: draft {:.1}ms | forward2 {:.1}ms | head {:.1}ms | restore {:.1}ms | sample {:.1}ms  ({} sweeps, {} emitted)",
+                1e3 * t_draft / v, 1e3 * t_fwd2 / v, 1e3 * t_head / v,
+                1e3 * t_restore / v, 1e3 * t_sample / v, verifies, emitted
+            );
         }
         if verifies > 0 && std::env::var("HOS_MTP_STATS").is_ok() {
             eprintln!(
@@ -1486,12 +1513,16 @@ pub struct Qwen35Gpu {
     #[allow(dead_code)] // held to keep the Metal device alive for the runner's lifetime
     device: Device,
     queue: CommandQueue,
-    p_mv_f16: ComputePipelineState,
     p_mv_q4k: ComputePipelineState,
     p_mv_q5k: ComputePipelineState,
     p_mv_q6k: ComputePipelineState,
     p_mv_q8: ComputePipelineState,
     p_rms: ComputePipelineState,
+    // fused residual-add+rmsnorm and coalesced f16 matvec (MLX-parity work)
+    p_add_rmsn: ComputePipelineState,
+    p_mv_f16_co: ComputePipelineState,
+    p_mv_q4k_v5: ComputePipelineState, // 4-rows/SG vectorized q4_k GEMV (decode fast path)
+    gemv_old: bool, // HOS_GEMV=old: use the original matvec_q4k_co
     p_rms_h: ComputePipelineState,
     p_l2_h: ComputePipelineState,
     p_sig_mul: ComputePipelineState,
@@ -1499,6 +1530,7 @@ pub struct Qwen35Gpu {
     p_decay: ComputePipelineState,
     p_conv: ComputePipelineState,
     p_delta: ComputePipelineState,
+    p_delta_f: ComputePipelineState, // fused sigmoid+decay+l2+delta+gated-norm
     p_gnorm: ComputePipelineState,
     p_rope: ComputePipelineState,
     p_store: ComputePipelineState,
@@ -1508,6 +1540,7 @@ pub struct Qwen35Gpu {
     p_qgate: ComputePipelineState,
     // 2-token (MTP verify) matmuls + state snapshot copy
     p_mm_q4k_2tok: ComputePipelineState,
+    p_mm_q4k_2tok_v5: ComputePipelineState,
     p_mm_q6k_2tok: ComputePipelineState,
     p_copy: ComputePipelineState,
     // activation buffers
@@ -1548,6 +1581,10 @@ pub struct Qwen35Gpu {
     // post-token-t snapshots for MTP verify rollback (per block; empty for attn blocks)
     snap_conv: Vec<Buffer>,
     snap_ssm: Vec<Buffer>,
+    // encoder experiment switch (HOS_QWEN35_ENC): 0=serial (default),
+    // 1=concurrent dispatch + same barriers, 2=concurrent, NO barriers — timing
+    // floor only, results are garbage. Measurement hook for the MLX-parity work.
+    enc_mode: u8,
 }
 
 #[cfg(target_os = "macos")]
@@ -1651,13 +1688,27 @@ impl Qwen35Gpu {
             }
         }
         eprintln!("[qwen35] GPU-resident runner ready");
+        // Concurrent dispatch + dependency-level barriers is the default (the
+        // barriers make it exactly as ordered as the serial encoder, validated
+        // byte-identical; independent dispatches in a level overlap). "serial"
+        // falls back to the serial encoder; "conc_nobar" drops the barriers —
+        // measurement floor ONLY, results are garbage.
+        let enc_mode = match std::env::var("HOS_QWEN35_ENC").as_deref() {
+            Ok("serial") => 0,
+            Ok("conc_nobar") => 2,
+            _ => 1,
+        };
         Qwen35Gpu {
-            p_mv_f16: pl("matvec_f16"),
+            enc_mode,
             p_mv_q4k: pl("matvec_q4k_co"),
             p_mv_q5k: pl("matvec_q5k_co"),
             p_mv_q6k: pl("matvec_q6k_co"),
             p_mv_q8: pl("matvec_q8_0_co"),
             p_rms: pl("rmsnorm"),
+            p_add_rmsn: pl("add_rmsnorm"),
+            p_mv_f16_co: pl("matvec_f16_co"),
+            p_mv_q4k_v5: pl("matvec_q4k_co_v5"),
+            gemv_old: crate::metal_be::q4k_gemv_old(),
             p_rms_h: pl("rmsnorm_heads"),
             p_l2_h: pl("l2norm_heads"),
             p_sig_mul: pl("sigmoid_mul"),
@@ -1665,6 +1716,7 @@ impl Qwen35Gpu {
             p_decay: pl("ssm_decay"),
             p_conv: pl("conv1d"),
             p_delta: pl("deltanet_multi"),
+            p_delta_f: pl("deltanet_fused"),
             p_gnorm: pl("gated_norm"),
             p_rope: pl("rope_partial"),
             p_store: pl("store_kv"),
@@ -1673,6 +1725,7 @@ impl Qwen35Gpu {
             p_add: pl("add_inplace"),
             p_qgate: pl("extract_qgate"),
             p_mm_q4k_2tok: pl("matmul_q4k_co2"),
+            p_mm_q4k_2tok_v5: pl("matmul_q4k_co2_v5"),
             p_mm_q6k_2tok: pl("matmul_q6k_co2"),
             p_copy: pl("copy_buf"),
             // Buffers hold up to 2 tokens ([tok0 | tok1]) so the same runner serves
@@ -1726,21 +1779,42 @@ impl Qwen35Gpu {
             .collect();
         enc.memory_barrier_with_resources(&r);
     }
+    // barrier honoring the HOS_QWEN35_ENC experiment mode (2 = no barriers: timing floor)
+    fn bar_m(&self, enc: &ComputeCommandEncoderRef, outs: &[&BufferRef]) {
+        if self.enc_mode != 2 {
+            Self::bar(enc, outs);
+        }
+    }
+    // per-token encoder honoring the experiment mode (serial today; concurrent for 1/2)
+    fn encoder<'a>(
+        &self,
+        cmd: &'a metal::CommandBufferRef,
+    ) -> &'a ComputeCommandEncoderRef {
+        if self.enc_mode == 0 {
+            cmd.new_compute_command_encoder()
+        } else {
+            cmd.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+        }
+    }
     fn set_u(enc: &ComputeCommandEncoderRef, idx: u64, val: u32) {
         enc.set_bytes(idx, 4, &val as *const u32 as *const c_void);
     }
     fn set_f(enc: &ComputeCommandEncoderRef, idx: u64, val: f32) {
         enc.set_bytes(idx, 4, &val as *const f32 as *const c_void);
     }
-    // matvec y = W x ; coalesced (32-lane/row) for K-quants, scalar for f16
-    fn mv(&self, enc: &ComputeCommandEncoderRef, w: &GpuMatrix, x: &BufferRef, y: &BufferRef) {
+    // matvec WITHOUT the trailing barrier — for encoding groups of independent
+    // matvecs that share one barrier (they overlap under the concurrent encoder).
+    fn mv_nb(&self, enc: &ComputeCommandEncoderRef, w: &GpuMatrix, x: &BufferRef, y: &BufferRef) {
         use crate::gguf::{GGML_F16, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0};
         let (p, coalesced) = match w.ggml_type {
-            GGML_Q4_K => (&self.p_mv_q4k, true),
+            GGML_Q4_K => (
+                if self.gemv_old { &self.p_mv_q4k } else { &self.p_mv_q4k_v5 },
+                true,
+            ),
             GGML_Q5_K => (&self.p_mv_q5k, true),
             GGML_Q6_K => (&self.p_mv_q6k, true),
             GGML_Q8_0 => (&self.p_mv_q8, true),
-            GGML_F16 => (&self.p_mv_f16, false),
+            GGML_F16 => (&self.p_mv_f16_co, false),
             t => {
                 eprintln!("[qwen35] no resident matvec for type {t}");
                 std::process::exit(2);
@@ -1752,16 +1826,60 @@ impl Qwen35Gpu {
         enc.set_buffer(2, Some(y), 0);
         Self::set_u(enc, 3, w.in_dim as u32);
         if coalesced {
-            // coalesced kernels process NDST=2 rows per 32-lane simdgroup and
-            // need n_rows in buffer(4) for the tail guard (must match metal_be).
-            const NDST: u64 = 2;
+            // v5 q4_k processes 4 rows per simdgroup; the other coalesced
+            // kernels process NDST=2 (n_rows in buffer(4) guards the tail).
+            use crate::gguf::GGML_Q4_K as Q4K;
+            let ndst: u64 = if !self.gemv_old && w.ggml_type == Q4K { 4 } else { 2 };
             Self::set_u(enc, 4, w.n_rows as u32);
-            let simdgroups = (w.n_rows as u64).div_ceil(NDST);
-            enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(32, 1, 1));
+            let simdgroups = (w.n_rows as u64).div_ceil(ndst);
+            enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(256, 1, 1));
         } else {
-            enc.dispatch_threads(MTLSize::new(w.n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+            // matvec_f16_co: one 32-lane simdgroup per row
+            enc.dispatch_threads(MTLSize::new(w.n_rows as u64 * 32, 1, 1), MTLSize::new(256, 1, 1));
         }
-        Self::bar(enc, &[y]);
+    }
+    // elementwise WITHOUT the trailing barrier (see mv_nb)
+    fn elt_nb(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        p: &ComputePipelineState,
+        a: &BufferRef,
+        b: Option<&BufferRef>,
+        n: usize,
+    ) {
+        enc.set_compute_pipeline_state(p);
+        enc.set_buffer(0, Some(a), 0);
+        if let Some(bb) = b {
+            enc.set_buffer(1, Some(bb), 0);
+        }
+        let tg = p.max_total_threads_per_threadgroup().min(256);
+        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
+    }
+    // matvec y = W x ; coalesced (32-lane/row) for K-quants, scalar for f16
+    fn mv(&self, enc: &ComputeCommandEncoderRef, w: &GpuMatrix, x: &BufferRef, y: &BufferRef) {
+        self.mv_nb(enc, w, x, y);
+        self.bar_m(enc, &[y]);
+    }
+    // x += y, then xb = rmsnorm(x, w) — one dispatch, one barrier level
+    fn add_rmsn(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &BufferRef,
+        y: &BufferRef,
+        w: &BufferRef,
+        xb: &BufferRef,
+        n: usize,
+        eps: f32,
+    ) {
+        enc.set_compute_pipeline_state(&self.p_add_rmsn);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(y), 0);
+        enc.set_buffer(2, Some(w), 0);
+        enc.set_buffer(3, Some(xb), 0);
+        Self::set_u(enc, 4, n as u32);
+        Self::set_f(enc, 5, eps);
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        self.bar_m(enc, &[x, xb]);
     }
     // matvec y = W x with byte offsets into x and y (one token's slice of a 2-token buffer)
     fn mv_off(
@@ -1775,11 +1893,14 @@ impl Qwen35Gpu {
     ) {
         use crate::gguf::{GGML_F16, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0};
         let (p, coalesced) = match w.ggml_type {
-            GGML_Q4_K => (&self.p_mv_q4k, true),
+            GGML_Q4_K => (
+                if self.gemv_old { &self.p_mv_q4k } else { &self.p_mv_q4k_v5 },
+                true,
+            ),
             GGML_Q5_K => (&self.p_mv_q5k, true),
             GGML_Q6_K => (&self.p_mv_q6k, true),
             GGML_Q8_0 => (&self.p_mv_q8, true),
-            GGML_F16 => (&self.p_mv_f16, false),
+            GGML_F16 => (&self.p_mv_f16_co, false),
             t => {
                 eprintln!("[qwen35] no resident matvec for type {t}");
                 std::process::exit(2);
@@ -1791,23 +1912,49 @@ impl Qwen35Gpu {
         enc.set_buffer(2, Some(y), yoff);
         Self::set_u(enc, 3, w.in_dim as u32);
         if coalesced {
-            const NDST: u64 = 2;
+            // v5 q4_k processes 4 rows per simdgroup; the other coalesced
+            // kernels process NDST=2 (n_rows in buffer(4) guards the tail).
+            use crate::gguf::GGML_Q4_K as Q4K;
+            let ndst: u64 = if !self.gemv_old && w.ggml_type == Q4K { 4 } else { 2 };
             Self::set_u(enc, 4, w.n_rows as u32);
-            let simdgroups = (w.n_rows as u64).div_ceil(NDST);
-            enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(32, 1, 1));
+            let simdgroups = (w.n_rows as u64).div_ceil(ndst);
+            enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(256, 1, 1));
         } else {
-            enc.dispatch_threads(MTLSize::new(w.n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+            // matvec_f16_co: one 32-lane simdgroup per row
+            enc.dispatch_threads(MTLSize::new(w.n_rows as u64 * 32, 1, 1), MTLSize::new(256, 1, 1));
         }
-        Self::bar(enc, &[y]);
+        self.bar_m(enc, &[y]);
     }
     // 2-token batched matvec: Y=[y_t | y_d] = W · [x_t | x_d]. For q4_k/q6_k the co2
     // kernel reads each weight row ONCE for both tokens (the MTP verify win); other
     // types fall back to two per-token matvecs (correct, weight read twice).
-    fn mv2(&self, enc: &ComputeCommandEncoderRef, w: &GpuMatrix, x: &BufferRef, y: &BufferRef) {
-        use crate::gguf::{GGML_Q4_K, GGML_Q6_K};
-        let p = match w.ggml_type {
-            GGML_Q4_K => &self.p_mm_q4k_2tok,
-            GGML_Q6_K => &self.p_mm_q6k_2tok,
+    // No trailing barrier — callers group independent matvecs under one barrier.
+    fn mv2_nb(&self, enc: &ComputeCommandEncoderRef, w: &GpuMatrix, x: &BufferRef, y: &BufferRef) {
+        use crate::gguf::{GGML_F16, GGML_Q4_K, GGML_Q6_K};
+        let (p, ndst): (&ComputePipelineState, u64) = match w.ggml_type {
+            GGML_Q4_K => {
+                if self.gemv_old {
+                    (&self.p_mm_q4k_2tok, 2)
+                } else {
+                    (&self.p_mm_q4k_2tok_v5, 4)
+                }
+            }
+            GGML_Q6_K => (&self.p_mm_q6k_2tok, 2),
+            GGML_F16 => {
+                // two coalesced per-token matvecs (independent — no barrier between)
+                for tau in 0..2u64 {
+                    enc.set_compute_pipeline_state(&self.p_mv_f16_co);
+                    enc.set_buffer(0, Some(w.buffer()), 0);
+                    enc.set_buffer(1, Some(x), tau * (w.in_dim as u64) * 4);
+                    enc.set_buffer(2, Some(y), tau * (w.n_rows as u64) * 4);
+                    Self::set_u(enc, 3, w.in_dim as u32);
+                    enc.dispatch_threads(
+                        MTLSize::new(w.n_rows as u64 * 32, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+                return;
+            }
             _ => {
                 self.mv_off(enc, w, x, 0, y, 0);
                 self.mv_off(enc, w, x, (w.in_dim as u64) * 4, y, (w.n_rows as u64) * 4);
@@ -1820,10 +1967,12 @@ impl Qwen35Gpu {
         enc.set_buffer(2, Some(y), 0);
         Self::set_u(enc, 3, w.in_dim as u32);
         Self::set_u(enc, 4, w.n_rows as u32);
-        const NDST: u64 = 2;
-        let simdgroups = (w.n_rows as u64).div_ceil(NDST);
-        enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(32, 1, 1));
-        Self::bar(enc, &[y]);
+        let simdgroups = (w.n_rows as u64).div_ceil(ndst);
+        enc.dispatch_threads(MTLSize::new(simdgroups * 32, 1, 1), MTLSize::new(256, 1, 1));
+    }
+    fn mv2(&self, enc: &ComputeCommandEncoderRef, w: &GpuMatrix, x: &BufferRef, y: &BufferRef) {
+        self.mv2_nb(enc, w, x, y);
+        self.bar_m(enc, &[y]);
     }
     // GPU buffer-to-buffer copy of `n` f32 (state snapshot for MTP rollback)
     fn copy(&self, enc: &ComputeCommandEncoderRef, src: &BufferRef, dst: &BufferRef, n: usize) {
@@ -1831,7 +1980,7 @@ impl Qwen35Gpu {
         enc.set_buffer(0, Some(src), 0);
         enc.set_buffer(1, Some(dst), 0);
         enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
-        Self::bar(enc, &[dst]);
+        self.bar_m(enc, &[dst]);
     }
     fn rms(
         &self,
@@ -1849,7 +1998,7 @@ impl Qwen35Gpu {
         Self::set_u(enc, 3, n as u32);
         Self::set_f(enc, 4, eps);
         enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-        Self::bar(enc, &[out]);
+        self.bar_m(enc, &[out]);
     }
     fn elt(
         &self,
@@ -1859,14 +2008,8 @@ impl Qwen35Gpu {
         b: Option<&BufferRef>,
         n: usize,
     ) {
-        enc.set_compute_pipeline_state(p);
-        enc.set_buffer(0, Some(a), 0);
-        if let Some(bb) = b {
-            enc.set_buffer(1, Some(bb), 0);
-        }
-        let tg = p.max_total_threads_per_threadgroup().min(256);
-        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
-        Self::bar(enc, &[a]);
+        self.elt_nb(enc, p, a, b, n);
+        self.bar_m(enc, &[a]);
     }
 
     pub fn forward(&self, m: &Qwen35, token: u32, pos: usize) -> Vec<f32> {
@@ -1887,15 +2030,23 @@ impl Qwen35Gpu {
             std::ptr::copy_nonoverlapping(row.as_ptr(), self.x.contents() as *mut f32, dim);
         }
 
+        let t_fwd = std::time::Instant::now();
         let cmd = self.queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = self.encoder(cmd);
+
+        // layer 0 input: xb = rmsnorm(embedding); later layers get xb from add_rmsn
+        self.rms(enc, &self.x, &self.attn_norm[0], &self.xb, dim, c.rms_eps);
 
         for (il, blk) in m.blocks.iter().enumerate() {
-            self.rms(enc, &self.x, &self.attn_norm[il], &self.xb, dim, c.rms_eps);
             match blk {
                 Block::Attn(w) => {
-                    self.mv(enc, w.wq.as_gpu(), &self.xb, &self.qfull);
-                    // extract q + gate
+                    // level: q/k/v projections all read xb — one barrier; they
+                    // overlap under the concurrent encoder
+                    self.mv_nb(enc, w.wq.as_gpu(), &self.xb, &self.qfull);
+                    self.mv_nb(enc, w.wk.as_gpu(), &self.xb, &self.k);
+                    self.mv_nb(enc, w.wv.as_gpu(), &self.xb, &self.v);
+                    self.bar_m(enc, &[&self.qfull, &self.k, &self.v]);
+                    // level: extract q+gate | k head-norm
                     enc.set_compute_pipeline_state(&self.p_qgate);
                     enc.set_buffer(0, Some(&self.qfull), 0);
                     enc.set_buffer(1, Some(&self.q), 0);
@@ -1905,20 +2056,6 @@ impl Qwen35Gpu {
                         MTLSize::new((nh * hd) as u64, 1, 1),
                         MTLSize::new(256, 1, 1),
                     );
-                    Self::bar(enc, &[&self.q, &self.gate]);
-                    self.mv(enc, w.wk.as_gpu(), &self.xb, &self.k);
-                    self.mv(enc, w.wv.as_gpu(), &self.xb, &self.v);
-                    // qk-norm per head
-                    enc.set_compute_pipeline_state(&self.p_rms_h);
-                    enc.set_buffer(0, Some(&self.q), 0);
-                    enc.set_buffer(1, Some(self.q_norm[il].as_ref().unwrap()), 0);
-                    Self::set_u(enc, 2, hd as u32);
-                    Self::set_f(enc, 3, c.rms_eps);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(nh as u64, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-                    Self::bar(enc, &[&self.q]);
                     enc.set_compute_pipeline_state(&self.p_rms_h);
                     enc.set_buffer(0, Some(&self.k), 0);
                     enc.set_buffer(1, Some(self.k_norm[il].as_ref().unwrap()), 0);
@@ -1928,22 +2065,39 @@ impl Qwen35Gpu {
                         MTLSize::new(nkv as u64, 1, 1),
                         MTLSize::new(256, 1, 1),
                     );
-                    Self::bar(enc, &[&self.k]);
-                    // partial rope
-                    for (buf, heads) in [(&self.q, nh), (&self.k, nkv)] {
-                        enc.set_compute_pipeline_state(&self.p_rope);
-                        enc.set_buffer(0, Some(buf), 0);
-                        Self::set_u(enc, 1, hd as u32);
-                        Self::set_u(enc, 2, c.rope_dim as u32);
-                        Self::set_u(enc, 3, pos as u32);
-                        Self::set_f(enc, 4, c.rope_base);
-                        enc.dispatch_threads(
-                            MTLSize::new((heads * c.rope_dim / 2) as u64, 1, 1),
-                            MTLSize::new(64, 1, 1),
-                        );
-                        Self::bar(enc, &[buf]);
-                    }
-                    // store kv
+                    self.bar_m(enc, &[&self.q, &self.gate, &self.k]);
+                    // level: q head-norm | k rope
+                    enc.set_compute_pipeline_state(&self.p_rms_h);
+                    enc.set_buffer(0, Some(&self.q), 0);
+                    enc.set_buffer(1, Some(self.q_norm[il].as_ref().unwrap()), 0);
+                    Self::set_u(enc, 2, hd as u32);
+                    Self::set_f(enc, 3, c.rms_eps);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(nh as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                    enc.set_compute_pipeline_state(&self.p_rope);
+                    enc.set_buffer(0, Some(&self.k), 0);
+                    Self::set_u(enc, 1, hd as u32);
+                    Self::set_u(enc, 2, c.rope_dim as u32);
+                    Self::set_u(enc, 3, pos as u32);
+                    Self::set_f(enc, 4, c.rope_base);
+                    enc.dispatch_threads(
+                        MTLSize::new((nkv * c.rope_dim / 2) as u64, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+                    self.bar_m(enc, &[&self.q, &self.k]);
+                    // level: q rope | store k/v into the cache
+                    enc.set_compute_pipeline_state(&self.p_rope);
+                    enc.set_buffer(0, Some(&self.q), 0);
+                    Self::set_u(enc, 1, hd as u32);
+                    Self::set_u(enc, 2, c.rope_dim as u32);
+                    Self::set_u(enc, 3, pos as u32);
+                    Self::set_f(enc, 4, c.rope_base);
+                    enc.dispatch_threads(
+                        MTLSize::new((nh * c.rope_dim / 2) as u64, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
                     enc.set_compute_pipeline_state(&self.p_store);
                     enc.set_buffer(0, Some(&self.k), 0);
                     enc.set_buffer(1, Some(&self.v), 0);
@@ -1955,7 +2109,7 @@ impl Qwen35Gpu {
                         MTLSize::new(kv_dim as u64, 1, 1),
                         MTLSize::new(256, 1, 1),
                     );
-                    Self::bar(enc, &[&self.kcache[il], &self.vcache[il]]);
+                    self.bar_m(enc, &[&self.q, &self.kcache[il], &self.vcache[il]]);
                     // attention
                     enc.set_compute_pipeline_state(&self.p_attn);
                     enc.set_buffer(0, Some(&self.q), 0);
@@ -1971,36 +2125,31 @@ impl Qwen35Gpu {
                         MTLSize::new(nh as u64, 1, 1),
                         MTLSize::new(hd as u64, 1, 1),
                     );
-                    Self::bar(enc, &[&self.att]);
+                    self.bar_m(enc, &[&self.att]);
                     self.elt(enc, &self.p_sig_mul, &self.att, Some(&self.gate), nh * hd);
                     self.mv(enc, w.wo.as_gpu(), &self.att, &self.xb);
                 }
                 Block::Lin(w) => {
-                    self.mv(enc, w.wqkv.as_gpu(), &self.xb, &self.qkv);
-                    self.mv(enc, w.wz.as_gpu(), &self.xb, &self.z);
-                    self.mv(
-                        enc,
-                        self.ssm_beta[il].as_ref().unwrap(),
-                        &self.xb,
-                        &self.beta,
-                    );
-                    self.elt(enc, &self.p_sig_ip, &self.beta, None, c.time_step_rank);
-                    self.mv(
-                        enc,
-                        self.ssm_alpha[il].as_ref().unwrap(),
-                        &self.xb,
-                        &self.decay,
-                    );
-                    enc.set_compute_pipeline_state(&self.p_decay);
-                    enc.set_buffer(0, Some(&self.decay), 0);
-                    enc.set_buffer(1, Some(self.ssm_a[il].as_ref().unwrap()), 0);
-                    enc.set_buffer(2, Some(self.ssm_dt[il].as_ref().unwrap()), 0);
-                    enc.dispatch_threads(
-                        MTLSize::new(c.time_step_rank as u64, 1, 1),
-                        MTLSize::new(32, 1, 1),
-                    );
-                    Self::bar(enc, &[&self.decay]);
-                    // conv1d
+                    // level: all four projections read xb — one barrier
+                    self.mv_nb(enc, w.wqkv.as_gpu(), &self.xb, &self.qkv);
+                    self.mv_nb(enc, w.wz.as_gpu(), &self.xb, &self.z);
+                    self.mv_nb(enc, self.ssm_beta[il].as_ref().unwrap(), &self.xb, &self.beta);
+                    self.mv_nb(enc, self.ssm_alpha[il].as_ref().unwrap(), &self.xb, &self.decay);
+                    self.bar_m(enc, &[&self.qkv, &self.z, &self.beta, &self.decay]);
+                    // conv1d (the beta sigmoid / decay transform now live in the
+                    // fused deltanet kernel when the head shape allows)
+                    let fusable = hv == 128 && c.state_size == 128;
+                    if !fusable {
+                        self.elt_nb(enc, &self.p_sig_ip, &self.beta, None, c.time_step_rank);
+                        enc.set_compute_pipeline_state(&self.p_decay);
+                        enc.set_buffer(0, Some(&self.decay), 0);
+                        enc.set_buffer(1, Some(self.ssm_a[il].as_ref().unwrap()), 0);
+                        enc.set_buffer(2, Some(self.ssm_dt[il].as_ref().unwrap()), 0);
+                        enc.dispatch_threads(
+                            MTLSize::new(c.time_step_rank as u64, 1, 1),
+                            MTLSize::new(32, 1, 1),
+                        );
+                    }
                     enc.set_compute_pipeline_state(&self.p_conv);
                     enc.set_buffer(0, Some(&self.qkv), 0);
                     enc.set_buffer(1, Some(&self.conv_state[il]), 0);
@@ -2011,71 +2160,115 @@ impl Qwen35Gpu {
                         MTLSize::new(conv_ch as u64, 1, 1),
                         MTLSize::new(256, 1, 1),
                     );
-                    Self::bar(enc, &[&self.conv_out, &self.conv_state[il]]);
-                    // l2 norm q and k regions
-                    for off in [q0b, k0b] {
-                        enc.set_compute_pipeline_state(&self.p_l2_h);
-                        enc.set_buffer(0, Some(&self.conv_out), off);
-                        Self::set_u(enc, 1, c.state_size as u32);
-                        Self::set_f(enc, 2, c.rms_eps);
+                    self.bar_m(
+                        enc,
+                        &[&self.beta, &self.decay, &self.conv_out, &self.conv_state[il]],
+                    );
+                    if fusable {
+                        // fused sigmoid+decay+l2+deltanet+gated-norm — one level
+                        enc.set_compute_pipeline_state(&self.p_delta_f);
+                        enc.set_buffer(0, Some(&self.ssm_state[il]), 0);
+                        enc.set_buffer(1, Some(&self.conv_out), q0b);
+                        enc.set_buffer(2, Some(&self.conv_out), k0b);
+                        enc.set_buffer(3, Some(&self.conv_out), v0b);
+                        enc.set_buffer(4, Some(&self.decay), 0);
+                        enc.set_buffer(5, Some(&self.beta), 0);
+                        enc.set_buffer(6, Some(&self.dout), 0);
+                        Self::set_u(enc, 7, hv as u32);
+                        Self::set_u(enc, 8, c.state_size as u32);
+                        Self::set_u(enc, 9, c.group_count as u32);
+                        Self::set_f(enc, 10, 1.0 / (c.state_size as f32).sqrt());
+                        enc.set_buffer(11, Some(self.ssm_a[il].as_ref().unwrap()), 0);
+                        enc.set_buffer(12, Some(self.ssm_dt[il].as_ref().unwrap()), 0);
+                        enc.set_buffer(13, Some(self.ssm_norm[il].as_ref().unwrap()), 0);
+                        enc.set_buffer(14, Some(&self.z), 0);
+                        Self::set_f(enc, 15, c.rms_eps);
                         enc.dispatch_thread_groups(
-                            MTLSize::new(c.group_count as u64, 1, 1),
-                            MTLSize::new(128, 1, 1),
+                            MTLSize::new(c.time_step_rank as u64, 1, 1),
+                            MTLSize::new(hv as u64, 1, 1),
                         );
-                        Self::bar(enc, &[&self.conv_out]);
+                        self.bar_m(enc, &[&self.dout, &self.ssm_state[il]]);
+                    } else {
+                        // level: l2 norm of the q and k regions (disjoint slices)
+                        for off in [q0b, k0b] {
+                            enc.set_compute_pipeline_state(&self.p_l2_h);
+                            enc.set_buffer(0, Some(&self.conv_out), off);
+                            Self::set_u(enc, 1, c.state_size as u32);
+                            Self::set_f(enc, 2, c.rms_eps);
+                            enc.dispatch_thread_groups(
+                                MTLSize::new(c.group_count as u64, 1, 1),
+                                MTLSize::new(128, 1, 1),
+                            );
+                        }
+                        self.bar_m(enc, &[&self.conv_out]);
+                        // deltanet
+                        enc.set_compute_pipeline_state(&self.p_delta);
+                        enc.set_buffer(0, Some(&self.ssm_state[il]), 0);
+                        enc.set_buffer(1, Some(&self.conv_out), q0b);
+                        enc.set_buffer(2, Some(&self.conv_out), k0b);
+                        enc.set_buffer(3, Some(&self.conv_out), v0b);
+                        enc.set_buffer(4, Some(&self.decay), 0);
+                        enc.set_buffer(5, Some(&self.beta), 0);
+                        enc.set_buffer(6, Some(&self.dout), 0);
+                        Self::set_u(enc, 7, hv as u32);
+                        Self::set_u(enc, 8, c.state_size as u32);
+                        Self::set_u(enc, 9, c.group_count as u32);
+                        Self::set_f(enc, 10, 1.0 / (c.state_size as f32).sqrt());
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(c.time_step_rank as u64, 1, 1),
+                            MTLSize::new(hv as u64, 1, 1),
+                        );
+                        self.bar_m(enc, &[&self.dout, &self.ssm_state[il]]);
+                        // gated norm
+                        enc.set_compute_pipeline_state(&self.p_gnorm);
+                        enc.set_buffer(0, Some(&self.dout), 0);
+                        enc.set_buffer(1, Some(self.ssm_norm[il].as_ref().unwrap()), 0);
+                        enc.set_buffer(2, Some(&self.z), 0);
+                        Self::set_u(enc, 3, hv as u32);
+                        Self::set_f(enc, 4, c.rms_eps);
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(c.time_step_rank as u64, 1, 1),
+                            MTLSize::new(hv as u64, 1, 1),
+                        );
+                        self.bar_m(enc, &[&self.dout]);
                     }
-                    // deltanet
-                    enc.set_compute_pipeline_state(&self.p_delta);
-                    enc.set_buffer(0, Some(&self.ssm_state[il]), 0);
-                    enc.set_buffer(1, Some(&self.conv_out), q0b);
-                    enc.set_buffer(2, Some(&self.conv_out), k0b);
-                    enc.set_buffer(3, Some(&self.conv_out), v0b);
-                    enc.set_buffer(4, Some(&self.decay), 0);
-                    enc.set_buffer(5, Some(&self.beta), 0);
-                    enc.set_buffer(6, Some(&self.dout), 0);
-                    Self::set_u(enc, 7, hv as u32);
-                    Self::set_u(enc, 8, c.state_size as u32);
-                    Self::set_u(enc, 9, c.group_count as u32);
-                    Self::set_f(enc, 10, 1.0 / (c.state_size as f32).sqrt());
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(c.time_step_rank as u64, 1, 1),
-                        MTLSize::new(hv as u64, 1, 1),
-                    );
-                    Self::bar(enc, &[&self.dout, &self.ssm_state[il]]);
-                    // gated norm
-                    enc.set_compute_pipeline_state(&self.p_gnorm);
-                    enc.set_buffer(0, Some(&self.dout), 0);
-                    enc.set_buffer(1, Some(self.ssm_norm[il].as_ref().unwrap()), 0);
-                    enc.set_buffer(2, Some(&self.z), 0);
-                    Self::set_u(enc, 3, hv as u32);
-                    Self::set_f(enc, 4, c.rms_eps);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(c.time_step_rank as u64, 1, 1),
-                        MTLSize::new(hv as u64, 1, 1),
-                    );
-                    Self::bar(enc, &[&self.dout]);
                     self.mv(enc, w.ssm_out.as_gpu(), &self.dout, &self.xb);
                 }
             }
-            self.elt(enc, &self.p_add, &self.x, Some(&self.xb), dim);
+            // residual add + FFN input norm, one dispatch: x += xb; xb = rmsnorm(x)
+            self.add_rmsn(enc, &self.x, &self.xb, &self.post_norm[il], &self.xb, dim, c.rms_eps);
             // FFN
             let (fg, fu, fd) = match blk {
                 Block::Attn(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
                 Block::Lin(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
             };
-            self.rms(enc, &self.x, &self.post_norm[il], &self.xb, dim, c.rms_eps);
-            self.mv(enc, fg.as_gpu(), &self.xb, &self.gbuf);
-            self.mv(enc, fu.as_gpu(), &self.xb, &self.ubuf);
+            // level: gate and up projections both read xb — one barrier
+            self.mv_nb(enc, fg.as_gpu(), &self.xb, &self.gbuf);
+            self.mv_nb(enc, fu.as_gpu(), &self.xb, &self.ubuf);
+            self.bar_m(enc, &[&self.gbuf, &self.ubuf]);
             self.elt(enc, &self.p_swiglu, &self.gbuf, Some(&self.ubuf), c.ffn_dim);
             self.mv(enc, fd.as_gpu(), &self.gbuf, &self.xb);
-            self.elt(enc, &self.p_add, &self.x, Some(&self.xb), dim);
+            // residual add + NEXT norm (next layer's input norm, or the output norm)
+            let next_nw = if il + 1 < m.blocks.len() {
+                &self.attn_norm[il + 1]
+            } else {
+                &self.output_norm
+            };
+            self.add_rmsn(enc, &self.x, &self.xb, next_nw, &self.xb, dim, c.rms_eps);
             let _ = f4;
         }
-        self.rms(enc, &self.x, &self.output_norm, &self.xb, dim, c.rms_eps);
         self.mv(enc, m.output.as_gpu(), &self.xb, &self.logits);
         enc.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
+        if std::env::var("HOS_QWEN35_ENC_TIMING").is_ok() {
+            let t_enc = t_fwd.elapsed().as_secs_f64() * 1000.0;
+            cmd.commit();
+            cmd.wait_until_completed();
+            let t_all = t_fwd.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[qwen35-enc] encode {t_enc:.2} ms, gpu {:.2} ms", t_all - t_enc);
+        } else {
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
         unsafe { std::slice::from_raw_parts(self.logits.contents() as *const f32, c.vocab) }
             .to_vec()
     }
@@ -2123,7 +2316,7 @@ impl Qwen35Gpu {
         }
 
         let cmd = self.queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = self.encoder(cmd);
 
         // per-token RMSNorm helper (offset-aware, single-token dispatch)
         let rms_o = |x: &BufferRef, xo: u64, w: &BufferRef, out: &BufferRef, oo: u64, n: usize| {
@@ -2134,16 +2327,36 @@ impl Qwen35Gpu {
             Self::set_u(enc, 3, n as u32);
             Self::set_f(enc, 4, eps);
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-            Self::bar(enc, &[out]);
+        };
+        // residual add + rmsnorm per token: x[tau] += xb[tau]; xb[tau] = rmsnorm(x[tau], w)
+        let add_rmsn_o = |tau: u64, w: &BufferRef| {
+            enc.set_compute_pipeline_state(&self.p_add_rmsn);
+            enc.set_buffer(0, Some(&self.x), tau * ox);
+            enc.set_buffer(1, Some(&self.xb), tau * ox);
+            enc.set_buffer(2, Some(w), 0);
+            enc.set_buffer(3, Some(&self.xb), tau * ox);
+            Self::set_u(enc, 4, dim as u32);
+            Self::set_f(enc, 5, eps);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         };
 
+        // layer 0 input: per-token rmsnorm of the embeddings; later layers get
+        // xb from the fused add_rmsn at the previous layer's tail
+        for tau in 0..2u64 {
+            rms_o(&self.x, tau * ox, &self.attn_norm[0], &self.xb, tau * ox, dim);
+        }
+        self.bar_m(enc, &[&self.xb]);
+        let n_blocks = m.blocks.len();
+        let fusable = hv == 128 && c.state_size == 128;
         for (il, blk) in m.blocks.iter().enumerate() {
-            for tau in 0..2u64 {
-                rms_o(&self.x, tau * ox, &self.attn_norm[il], &self.xb, tau * ox, dim);
-            }
             match blk {
                 Block::Attn(w) => {
-                    self.mv2(enc, w.wq.as_gpu(), &self.xb, &self.qfull);
+                    // level: q/k/v projections, each 2-token batched
+                    self.mv2_nb(enc, w.wq.as_gpu(), &self.xb, &self.qfull);
+                    self.mv2_nb(enc, w.wk.as_gpu(), &self.xb, &self.k);
+                    self.mv2_nb(enc, w.wv.as_gpu(), &self.xb, &self.v);
+                    self.bar_m(enc, &[&self.qfull, &self.k, &self.v]);
+                    // level: qgate extract x2 | k head-norm x2
                     for tau in 0..2u64 {
                         enc.set_compute_pipeline_state(&self.p_qgate);
                         enc.set_buffer(0, Some(&self.qfull), tau * oqf);
@@ -2152,20 +2365,6 @@ impl Qwen35Gpu {
                         Self::set_u(enc, 3, hd as u32);
                         enc.dispatch_threads(
                             MTLSize::new((nh * hd) as u64, 1, 1),
-                            MTLSize::new(256, 1, 1),
-                        );
-                    }
-                    Self::bar(enc, &[&self.q, &self.gate]);
-                    self.mv2(enc, w.wk.as_gpu(), &self.xb, &self.k);
-                    self.mv2(enc, w.wv.as_gpu(), &self.xb, &self.v);
-                    for tau in 0..2u64 {
-                        enc.set_compute_pipeline_state(&self.p_rms_h);
-                        enc.set_buffer(0, Some(&self.q), tau * oq);
-                        enc.set_buffer(1, Some(self.q_norm[il].as_ref().unwrap()), 0);
-                        Self::set_u(enc, 2, hd as u32);
-                        Self::set_f(enc, 3, eps);
-                        enc.dispatch_thread_groups(
-                            MTLSize::new(nh as u64, 1, 1),
                             MTLSize::new(256, 1, 1),
                         );
                         enc.set_compute_pipeline_state(&self.p_rms_h);
@@ -2178,27 +2377,42 @@ impl Qwen35Gpu {
                             MTLSize::new(256, 1, 1),
                         );
                     }
-                    Self::bar(enc, &[&self.q, &self.k]);
-                    // partial rope per token (token tau at pos+tau)
+                    self.bar_m(enc, &[&self.q, &self.gate, &self.k]);
+                    // level: q head-norm x2 | k rope x2
                     for tau in 0..2u64 {
-                        for (buf, off, heads) in
-                            [(&self.q, tau * oq, nh), (&self.k, tau * okv, nkv)]
-                        {
-                            enc.set_compute_pipeline_state(&self.p_rope);
-                            enc.set_buffer(0, Some(buf), off);
-                            Self::set_u(enc, 1, hd as u32);
-                            Self::set_u(enc, 2, c.rope_dim as u32);
-                            Self::set_u(enc, 3, (pos + tau as usize) as u32);
-                            Self::set_f(enc, 4, c.rope_base);
-                            enc.dispatch_threads(
-                                MTLSize::new((heads * c.rope_dim / 2) as u64, 1, 1),
-                                MTLSize::new(64, 1, 1),
-                            );
-                        }
+                        enc.set_compute_pipeline_state(&self.p_rms_h);
+                        enc.set_buffer(0, Some(&self.q), tau * oq);
+                        enc.set_buffer(1, Some(self.q_norm[il].as_ref().unwrap()), 0);
+                        Self::set_u(enc, 2, hd as u32);
+                        Self::set_f(enc, 3, eps);
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(nh as u64, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                        enc.set_compute_pipeline_state(&self.p_rope);
+                        enc.set_buffer(0, Some(&self.k), tau * okv);
+                        Self::set_u(enc, 1, hd as u32);
+                        Self::set_u(enc, 2, c.rope_dim as u32);
+                        Self::set_u(enc, 3, (pos + tau as usize) as u32);
+                        Self::set_f(enc, 4, c.rope_base);
+                        enc.dispatch_threads(
+                            MTLSize::new((nkv * c.rope_dim / 2) as u64, 1, 1),
+                            MTLSize::new(64, 1, 1),
+                        );
                     }
-                    Self::bar(enc, &[&self.q, &self.k]);
-                    // store kv then attend, sequenced per token (d attends over t's kv)
+                    self.bar_m(enc, &[&self.q, &self.k]);
+                    // level: q rope x2 | store k/v x2 (distinct cache slots)
                     for tau in 0..2u64 {
+                        enc.set_compute_pipeline_state(&self.p_rope);
+                        enc.set_buffer(0, Some(&self.q), tau * oq);
+                        Self::set_u(enc, 1, hd as u32);
+                        Self::set_u(enc, 2, c.rope_dim as u32);
+                        Self::set_u(enc, 3, (pos + tau as usize) as u32);
+                        Self::set_f(enc, 4, c.rope_base);
+                        enc.dispatch_threads(
+                            MTLSize::new((nh * c.rope_dim / 2) as u64, 1, 1),
+                            MTLSize::new(64, 1, 1),
+                        );
                         enc.set_compute_pipeline_state(&self.p_store);
                         enc.set_buffer(0, Some(&self.k), tau * okv);
                         enc.set_buffer(1, Some(&self.v), tau * okv);
@@ -2210,7 +2424,11 @@ impl Qwen35Gpu {
                             MTLSize::new(kv_dim as u64, 1, 1),
                             MTLSize::new(256, 1, 1),
                         );
-                        Self::bar(enc, &[&self.kcache[il], &self.vcache[il]]);
+                    }
+                    self.bar_m(enc, &[&self.q, &self.kcache[il], &self.vcache[il]]);
+                    // level: attention x2 — token t masks at pos, so token d's
+                    // stored KV entry at pos+1 is invisible to it (safe to overlap)
+                    for tau in 0..2u64 {
                         enc.set_compute_pipeline_state(&self.p_attn);
                         enc.set_buffer(0, Some(&self.q), tau * oq);
                         enc.set_buffer(1, Some(&self.kcache[il]), 0);
@@ -2224,8 +2442,8 @@ impl Qwen35Gpu {
                             MTLSize::new(nh as u64, 1, 1),
                             MTLSize::new(hd as u64, 1, 1),
                         );
-                        Self::bar(enc, &[&self.att]);
                     }
+                    self.bar_m(enc, &[&self.att]);
                     for tau in 0..2u64 {
                         enc.set_compute_pipeline_state(&self.p_sig_mul);
                         enc.set_buffer(0, Some(&self.att), tau * oq);
@@ -2235,14 +2453,92 @@ impl Qwen35Gpu {
                             MTLSize::new(256, 1, 1),
                         );
                     }
-                    Self::bar(enc, &[&self.att]);
+                    self.bar_m(enc, &[&self.att]);
                     self.mv2(enc, w.wo.as_gpu(), &self.att, &self.xb);
                 }
                 Block::Lin(w) => {
-                    self.mv2(enc, w.wqkv.as_gpu(), &self.xb, &self.qkv);
-                    self.mv2(enc, w.wz.as_gpu(), &self.xb, &self.z);
-                    self.mv2(enc, self.ssm_beta[il].as_ref().unwrap(), &self.xb, &self.beta);
-                    self.mv2(enc, self.ssm_alpha[il].as_ref().unwrap(), &self.xb, &self.decay);
+                    // level: all four projections read xb
+                    self.mv2_nb(enc, w.wqkv.as_gpu(), &self.xb, &self.qkv);
+                    self.mv2_nb(enc, w.wz.as_gpu(), &self.xb, &self.z);
+                    self.mv2_nb(enc, self.ssm_beta[il].as_ref().unwrap(), &self.xb, &self.beta);
+                    self.mv2_nb(enc, self.ssm_alpha[il].as_ref().unwrap(), &self.xb, &self.decay);
+                    self.bar_m(enc, &[&self.qkv, &self.z, &self.beta, &self.decay]);
+                    if fusable {
+                        // conv token t (recurrent state advance)
+                        enc.set_compute_pipeline_state(&self.p_conv);
+                        enc.set_buffer(0, Some(&self.qkv), 0);
+                        enc.set_buffer(1, Some(&self.conv_state[il]), 0);
+                        enc.set_buffer(2, Some(self.conv_w[il].as_ref().unwrap()), 0);
+                        enc.set_buffer(3, Some(&self.conv_out), 0);
+                        Self::set_u(enc, 4, c.conv_kernel as u32);
+                        enc.dispatch_threads(
+                            MTLSize::new(conv_ch as u64, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                        self.bar_m(enc, &[&self.conv_out, &self.conv_state[il]]);
+                        // level: conv-state snapshot | fused deltanet(t)
+                        enc.set_compute_pipeline_state(&self.p_copy);
+                        enc.set_buffer(0, Some(&self.conv_state[il]), 0);
+                        enc.set_buffer(1, Some(&self.snap_conv[il]), 0);
+                        enc.dispatch_threads(
+                            MTLSize::new((conv_ch * (c.conv_kernel - 1)) as u64, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                        let delta_f = |tau: u64| {
+                            enc.set_compute_pipeline_state(&self.p_delta_f);
+                            enc.set_buffer(0, Some(&self.ssm_state[il]), 0);
+                            enc.set_buffer(1, Some(&self.conv_out), tau * och + q0b);
+                            enc.set_buffer(2, Some(&self.conv_out), tau * och + k0b);
+                            enc.set_buffer(3, Some(&self.conv_out), tau * och + v0b);
+                            enc.set_buffer(4, Some(&self.decay), tau * otsr);
+                            enc.set_buffer(5, Some(&self.beta), tau * otsr);
+                            enc.set_buffer(6, Some(&self.dout), tau * oin);
+                            Self::set_u(enc, 7, hv as u32);
+                            Self::set_u(enc, 8, c.state_size as u32);
+                            Self::set_u(enc, 9, c.group_count as u32);
+                            Self::set_f(enc, 10, 1.0 / (c.state_size as f32).sqrt());
+                            enc.set_buffer(11, Some(self.ssm_a[il].as_ref().unwrap()), 0);
+                            enc.set_buffer(12, Some(self.ssm_dt[il].as_ref().unwrap()), 0);
+                            enc.set_buffer(13, Some(self.ssm_norm[il].as_ref().unwrap()), 0);
+                            enc.set_buffer(14, Some(&self.z), tau * oin);
+                            Self::set_f(enc, 15, eps);
+                            enc.dispatch_thread_groups(
+                                MTLSize::new(c.time_step_rank as u64, 1, 1),
+                                MTLSize::new(hv as u64, 1, 1),
+                            );
+                        };
+                        delta_f(0);
+                        self.bar_m(
+                            enc,
+                            &[&self.snap_conv[il], &self.dout, &self.ssm_state[il]],
+                        );
+                        // level: conv token d | ssm-state snapshot (post-t)
+                        enc.set_compute_pipeline_state(&self.p_conv);
+                        enc.set_buffer(0, Some(&self.qkv), och);
+                        enc.set_buffer(1, Some(&self.conv_state[il]), 0);
+                        enc.set_buffer(2, Some(self.conv_w[il].as_ref().unwrap()), 0);
+                        enc.set_buffer(3, Some(&self.conv_out), och);
+                        Self::set_u(enc, 4, c.conv_kernel as u32);
+                        enc.dispatch_threads(
+                            MTLSize::new(conv_ch as u64, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                        enc.set_compute_pipeline_state(&self.p_copy);
+                        enc.set_buffer(0, Some(&self.ssm_state[il]), 0);
+                        enc.set_buffer(1, Some(&self.snap_ssm[il]), 0);
+                        enc.dispatch_threads(
+                            MTLSize::new((c.time_step_rank * hv * hv) as u64, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                        self.bar_m(
+                            enc,
+                            &[&self.conv_out, &self.conv_state[il], &self.snap_ssm[il]],
+                        );
+                        // fused deltanet(d)
+                        delta_f(1);
+                        self.bar_m(enc, &[&self.dout, &self.ssm_state[il]]);
+                        self.mv2(enc, w.ssm_out.as_gpu(), &self.dout, &self.xb);
+                    } else {
                     for tau in 0..2u64 {
                         enc.set_compute_pipeline_state(&self.p_sig_ip);
                         enc.set_buffer(0, Some(&self.beta), tau * otsr);
@@ -2259,7 +2555,7 @@ impl Qwen35Gpu {
                             MTLSize::new(32, 1, 1),
                         );
                     }
-                    Self::bar(enc, &[&self.beta, &self.decay]);
+                    self.bar_m(enc, &[&self.beta, &self.decay]);
                     // conv1d: recurrent -> token t, snapshot conv state, token d
                     for tau in 0..2u64 {
                         enc.set_compute_pipeline_state(&self.p_conv);
@@ -2272,7 +2568,7 @@ impl Qwen35Gpu {
                             MTLSize::new(conv_ch as u64, 1, 1),
                             MTLSize::new(256, 1, 1),
                         );
-                        Self::bar(enc, &[&self.conv_out, &self.conv_state[il]]);
+                        self.bar_m(enc, &[&self.conv_out, &self.conv_state[il]]);
                         if tau == 0 {
                             self.copy(
                                 enc,
@@ -2294,7 +2590,7 @@ impl Qwen35Gpu {
                             );
                         }
                     }
-                    Self::bar(enc, &[&self.conv_out]);
+                    self.bar_m(enc, &[&self.conv_out]);
                     // deltanet: recurrent -> token t, snapshot ssm state, token d
                     for tau in 0..2u64 {
                         enc.set_compute_pipeline_state(&self.p_delta);
@@ -2313,7 +2609,7 @@ impl Qwen35Gpu {
                             MTLSize::new(c.time_step_rank as u64, 1, 1),
                             MTLSize::new(hv as u64, 1, 1),
                         );
-                        Self::bar(enc, &[&self.dout, &self.ssm_state[il]]);
+                        self.bar_m(enc, &[&self.dout, &self.ssm_state[il]]);
                         if tau == 0 {
                             self.copy(
                                 enc,
@@ -2335,27 +2631,25 @@ impl Qwen35Gpu {
                             MTLSize::new(hv as u64, 1, 1),
                         );
                     }
-                    Self::bar(enc, &[&self.dout]);
+                    self.bar_m(enc, &[&self.dout]);
                     self.mv2(enc, w.ssm_out.as_gpu(), &self.dout, &self.xb);
+                    }
                 }
             }
+            // level: residual add + FFN input norm per token, one dispatch each
             for tau in 0..2u64 {
-                enc.set_compute_pipeline_state(&self.p_add);
-                enc.set_buffer(0, Some(&self.x), tau * ox);
-                enc.set_buffer(1, Some(&self.xb), tau * ox);
-                enc.dispatch_threads(MTLSize::new(dim as u64, 1, 1), MTLSize::new(256, 1, 1));
+                add_rmsn_o(tau, &self.post_norm[il]);
             }
-            Self::bar(enc, &[&self.x]);
+            self.bar_m(enc, &[&self.x, &self.xb]);
             // FFN
             let (fg, fu, fd) = match blk {
                 Block::Attn(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
                 Block::Lin(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
             };
-            for tau in 0..2u64 {
-                rms_o(&self.x, tau * ox, &self.post_norm[il], &self.xb, tau * ox, dim);
-            }
-            self.mv2(enc, fg.as_gpu(), &self.xb, &self.gbuf);
-            self.mv2(enc, fu.as_gpu(), &self.xb, &self.ubuf);
+            // level: gate and up projections
+            self.mv2_nb(enc, fg.as_gpu(), &self.xb, &self.gbuf);
+            self.mv2_nb(enc, fu.as_gpu(), &self.xb, &self.ubuf);
+            self.bar_m(enc, &[&self.gbuf, &self.ubuf]);
             for tau in 0..2u64 {
                 enc.set_compute_pipeline_state(&self.p_swiglu);
                 enc.set_buffer(0, Some(&self.gbuf), tau * offn);
@@ -2365,20 +2659,32 @@ impl Qwen35Gpu {
                     MTLSize::new(256, 1, 1),
                 );
             }
-            Self::bar(enc, &[&self.gbuf]);
+            self.bar_m(enc, &[&self.gbuf]);
             self.mv2(enc, fd.as_gpu(), &self.gbuf, &self.xb);
-            for tau in 0..2u64 {
-                enc.set_compute_pipeline_state(&self.p_add);
-                enc.set_buffer(0, Some(&self.x), tau * ox);
-                enc.set_buffer(1, Some(&self.xb), tau * ox);
-                enc.dispatch_threads(MTLSize::new(dim as u64, 1, 1), MTLSize::new(256, 1, 1));
+            if il + 1 < n_blocks {
+                // residual add + NEXT layer's input norm, one dispatch per token
+                for tau in 0..2u64 {
+                    add_rmsn_o(tau, &self.attn_norm[il + 1]);
+                }
+                self.bar_m(enc, &[&self.x, &self.xb]);
+            } else {
+                // last layer: plain residual add (caller wants pre-norm hidden)
+                for tau in 0..2u64 {
+                    enc.set_compute_pipeline_state(&self.p_add);
+                    enc.set_buffer(0, Some(&self.x), tau * ox);
+                    enc.set_buffer(1, Some(&self.xb), tau * ox);
+                    enc.dispatch_threads(MTLSize::new(dim as u64, 1, 1), MTLSize::new(256, 1, 1));
+                }
+                self.bar_m(enc, &[&self.x]);
             }
-            Self::bar(enc, &[&self.x]);
         }
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
         // return both pre-output-norm hidden states [hidden_t | hidden_d]
+        // (a batched in-buffer 2-token lm_head was tried here and measured net
+        // slower than the caller's on-demand head() calls: the second token's
+        // head is only needed on accept, 66% of sweeps)
         unsafe { std::slice::from_raw_parts(self.x.contents() as *const f32, 2 * dim) }.to_vec()
     }
 
@@ -2390,7 +2696,7 @@ impl Qwen35Gpu {
         let hv = c.inner_size / c.time_step_rank;
         let conv_ch = c.inner_size + 2 * c.group_count * c.state_size;
         let cmd = self.queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = self.encoder(cmd);
         for (il, blk) in m.blocks.iter().enumerate() {
             if let Block::Lin(_) = blk {
                 self.copy(
@@ -2750,9 +3056,11 @@ impl ChatSession {
                 x0[i * dim..i * dim + dim].copy_from_slice(tb);
             }
         }
-        // MTP self-speculative decode on the resident runner: lossless (byte-identical
-        // to greedy) and ~1.6x faster. Active when the model has an MTP head and the
-        // resident GPU runner is present; opt-out via HOS_QWEN35_NO_MTP.
+        // MTP self-speculative decode on the resident runner: lossless, and after
+        // the forward2 restructure (level barriers + word-major 2-token v5 GEMV +
+        // fused deltanet) the fastest decode path — ~28.7 vs 23.3 tok/s single-token
+        // (the 2-token verify reads each weight once for both tokens). Default on;
+        // opt-out via HOS_QWEN35_NO_MTP.
         #[cfg(target_os = "macos")]
         if self.model.has_mtp()
             && self.resident.is_some()
@@ -2840,6 +3148,29 @@ impl ChatSession {
         #[cfg(target_os = "macos")]
         if let Some(r) = &self.resident {
             r.upload_state(&self.model, &self.state, pos);
+        }
+        // HOS_QWEN35_DECODE_BENCH=N: time N raw resident forward() calls (no
+        // sampling) and exit. Measurement hook for the MLX-parity work — it is
+        // the only way to time the HOS_QWEN35_ENC=conc_nobar floor, whose
+        // logits are garbage by design.
+        #[cfg(target_os = "macos")]
+        if let (Some(r), Ok(nstr)) = (&self.resident, std::env::var("HOS_QWEN35_DECODE_BENCH")) {
+            let nb: usize = nstr.parse().unwrap_or(64);
+            let t = &ids[ids.len() - 1];
+            for i in 0..4 {
+                r.forward(&self.model, *t, pos + i); // warmup
+            }
+            let t0 = std::time::Instant::now();
+            for i in 0..nb {
+                r.forward(&self.model, *t, pos + 4 + i);
+            }
+            let s = t0.elapsed().as_secs_f64();
+            eprintln!(
+                "[qwen35-decode-bench] {nb} fwd in {s:.2}s = {:.1} tok/s ({:.1} ms/token)",
+                nb as f64 / s,
+                s * 1000.0 / nb as f64
+            );
+            return 0;
         }
 
         let mut rng = if seed != 0 { seed } else { 42 };
