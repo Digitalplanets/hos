@@ -220,6 +220,11 @@ impl GpuRunner {
     pub fn prefill_step(&self, _model: &Model, _token: u32, _pos: usize) {
         unreachable!("{NO_GPU}")
     }
+    /// Largest prompt chunk the batched prefill takes in one pass (no GPU here:
+    /// the chunked prefill loop never runs, it falls back to the CPU path).
+    pub fn max_batch(&self) -> usize {
+        1
+    }
     pub fn forward_prefill_gpu(
         &self,
         _model: &Model,
