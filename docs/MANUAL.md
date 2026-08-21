@@ -255,7 +255,7 @@ map to the `HOS_GEMMA4_QUANT` variable.
 |---|---|
 | `hos --verify-against <hf_dir> -m model.gguf` | Audit a quantized GGUF against its original HuggingFace checkpoint. |
 | `hos --interp-check` | Interpretability / internal-state check. |
-| `hos --qwen35-check` | Detect and inspect the Qwen3.5 hybrid SSM/Mamba architecture. An experimental CPU runner exists; the standard transformer path is the supported one. |
+| `hos --qwen35-check` | Detect and inspect a Qwen3.5 hybrid (Gated-DeltaNet + attention) model's structure. |
 | `hos --deltanet-test` | Gated delta-net (Qwen3.5 hybrid) unit path. |
 | `hos --hos-selfrun` / `--selfrun-tf` | Load-and-run self-tests for the `.hos` path. |
 
@@ -299,7 +299,7 @@ with `hos --hos-info model.hos`. The byte-level spec is in
 | Gemma 2 / Gemma 3 / Gemma 4 | CPU (+ Gemma multimodal path) | Embed scale, GeGLU, attention and final soft-cap, sandwich norms, native image path. |
 | Phi-3 | CPU | Fused QKV and gate-up tensors split on load. |
 | OLMoE | CPU | Mixture-of-experts: top-k routing, experts kept quantized. |
-| Qwen3.5 (hybrid SSM/Mamba) | CPU (experimental) | Detectable and inspectable via `--qwen35-check`. |
+| Qwen3.5 (hybrid Gated-DeltaNet + attention) | CPU, GPU | Native runner with MTP speculative decoding and vision; GGUF or minted `.hos`. |
 
 The engine is architecture-aware: it auto-selects RoPE style, attention bias,
 tied embeddings, and per-arch norm and activation quirks from the model's

@@ -15,7 +15,7 @@ inference.
 
 > Tooling note: commands below are the standard **MLX-LM** LoRA flow for Apple
 > Silicon. Verify exact flags against the current `mlx-lm` docs before running —
-> the API moves. (Ask and I'll check the latest.)
+> the API moves.
 
 ---
 
@@ -99,13 +99,13 @@ This produces a standalone model (safetensors) with your tuning baked in.
 
 ## 5. Convert to GGUF + quantize (so HOS can run it)
 
-Using the llama.cpp tools you already have at `~/llama.cpp`:
+Using the conversion tools from a `llama.cpp` checkout:
 
 ```sh
-python ~/llama.cpp/convert_hf_to_gguf.py ./my-model-merged \
+python path/to/llama.cpp/convert_hf_to_gguf.py ./my-model-merged \
   --outfile my-model-f16.gguf --outtype f16
 
-~/llama.cpp/build/bin/llama-quantize my-model-f16.gguf my-model-Q4_K_M.gguf Q4_K_M
+path/to/llama.cpp/build/bin/llama-quantize my-model-f16.gguf my-model-Q4_K_M.gguf Q4_K_M
 ```
 
 ---
@@ -140,5 +140,4 @@ engine.** Iterate on the dataset; re-tune; re-serve.
 Building HOS's own **tensor + autograd library** (so HOS itself can train, not
 just serve) is the full-ownership project — feasible but months of work. The
 practical path above gets you a real fine-tune now; the library is the
-"own-the-entire-stack" goal to pursue separately if/when you want it. See the
-roadmap in chat / `ARCHITECTURE.md`.
+"own-the-entire-stack" path; see `ARCHITECTURE.md`.

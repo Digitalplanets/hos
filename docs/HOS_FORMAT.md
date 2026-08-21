@@ -131,7 +131,7 @@ optimizer state stay f32. The encoder is shared with the GGUF writer.
 - **Runnable.** Both `hos --to-hos <gguf>` and `hos --ingest <hf-dir>` write a
   capsule whose card carries the full engine metadata (`card.meta`:
   hyperparameters + tokenizer), and `hos -m model.hos` / `flwr run model.hos`
-  load and run it directly (CPU; GPU for `.hos` is roadmap). Verified
+  load and run it directly on CPU or GPU. Verified
   bit-identical to the source — GGUF: Qwen2.5-0.5B both 22.533; HF: SmolLM2-135M
   checkpoint and `.hos` both 42.288.
 - **Quantization targets:** `--quantize q8_0 | q4_0 | q5_0 | q6_k | q5_k | q4_k`

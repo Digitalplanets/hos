@@ -32,13 +32,14 @@ and dispatches the right variant (`gpt-2` / `qwen2` / `llama-bpe`) from the
 model's metadata. Loading and parsing are "fully fallible", meaning a missing,
 malformed, or unsupported model returns a clean error instead of panicking.
 
-Hybrid SSM/Mamba models (Qwen3.5 `qwen35`) are detected and inspectable
-(`hos --qwen35-check`); an experimental CPU+GPU runner exists but the standard
-transformer path above is the supported one.
+Hybrid Gated-DeltaNet/attention models (Qwen3.5, `qwen35`) run on their own
+native runner — CPU, and GPU-resident on Apple Silicon with speculative (MTP)
+decoding and vision — in `flwr run` and `flwr serve`, from GGUF or a minted
+`.hos` capsule.
 
-On an Apple M4 Max, the GPU backend runs Llama-3.2-1B (Q4_K_M) at ~6× the CPU speed,
-with weights resident at their compressed size. Reproduce throughput and quality
-on your own machine with `hos --bench` and `hos --perplexity` (below).
+On Apple Silicon, the GPU backend runs the supported families with weights
+resident at their compressed size. Measure throughput and quality on your own
+machine with `hos --bench` and `hos --perplexity` (below).
 
 ## Build & install
 

@@ -420,7 +420,7 @@ variants for programmatic handling, or surface `Display` to users.
 - **GGUF is mmap-backed** (`memmap2`); load is fast and pages in lazily.
 - **CPU path** uses `rayon` for matmul parallelism. **GPU path** (Apple Metal)
   is verified bit-identical to CPU on the supported arches and runs materially
-  faster (≈6× on Llama-3.2-1B Q4_K_M on an M4 Max).
+  faster.
 - **Activations** on the inference fast-path are kept in `f32`/`f16` buffers; the
   KV cache grows with sequence length up to the model's context limit.
 - Reproduce numbers on your hardware with `Engine::bench` and `Engine::perplexity`

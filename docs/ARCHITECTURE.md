@@ -42,7 +42,8 @@ Two inference families:
 - **Standard transformers** (Llama / Mistral / Qwen2): `model.rs` + `forward.rs`
   (CPU) and `metal_be::GpuRunner` (GPU).
 - **Qwen3.5 hybrid** (`qwen35`): `qwen35.rs` — `Qwen35` (CPU) and `Qwen35Gpu`
-  (GPU-resident). Experimental.
+  (GPU-resident, with the 2-token MTP verify); `qwen35_vision.rs` for the vision
+  tower; `qwen35_hf.rs` mints `.hos` capsules from HF checkpoints.
 
 …plus a **training + format stack** (`tensor.rs` autograd, `interp.rs` spec
 interpreter, `format.rs` `.hos` files, `train.rs`) that is independent of the

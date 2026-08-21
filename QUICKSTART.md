@@ -35,7 +35,7 @@ flwr serve mymodel.hos --gpu --port 11434
 ```
 
 ## Notes
-- **Mac:** full Metal acceleration. A 1B Q4_K model runs ~150 tok/s on an M4.
+- **Mac:** full Metal acceleration on Apple Silicon.
 - **Windows:** CPU inference (AVX2). GPU is Metal-only by design.
 - **`.flwr` vs `.hos`:** identical format. `.hos` is the engine capsule; `.flwr` is the
   same bytes wearing flwr's label. Either loads anywhere — the engine reads by content,

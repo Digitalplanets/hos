@@ -214,9 +214,8 @@ Silicon, so one portable binary is fast on whatever CPU it lands on, no build
 flags required.
 
 On Apple Silicon, the Metal backend runs the same math on the GPU and is verified
-**bit-identical** to the CPU result on the GPU families. On an M4 Max, the GPU
-backend runs Llama-3.2-1B (Q4_K_M) at roughly six times CPU speed with weights
-resident at their compressed size. HOS is not trying to win a tok/s sprint
+**bit-identical** to the CPU result on the GPU families, with weights resident
+at their compressed size. HOS is not trying to win a tok/s sprint
 against a decade of `llama.cpp` kernel tuning. It is trying to be the engine that
 is competitive *and* readable *and* yours.
 
@@ -237,7 +236,7 @@ draft head; HOS uses it to propose the next token, then verifies the proposal wi
 the backbone in a single batched two-token GPU pass (the weights are read once for
 both, which is where the speedup comes from). The emitted token is always a fresh
 backbone sample, so the output is **lossless** — byte-identical to ordinary
-decoding — while running roughly 1.6x faster on an M4 Max. Speculation that changes
+decoding — while typically running faster than plain decoding. Speculation that changes
 speed but never changes the answer.
 
 ---
