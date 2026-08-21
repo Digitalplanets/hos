@@ -42,7 +42,7 @@ cargo build --release       # binaries land in target/release/
 
 Platform notes:
 
-- macOS (Apple Silicon): full Metal GPU acceleration is available with `--gpu`.
+- macOS (Apple Silicon): full Metal GPU acceleration, on by default (`--cpu` to opt out).
 - Windows and Linux (x86-64): CPU inference, accelerated with AVX2 where present.
 - GPU acceleration is Metal-only by design. On non-Apple hardware everything runs
   on the CPU path.
@@ -57,11 +57,11 @@ flwr pull HuggingFaceTB/SmolLM2-135M-Instruct        # fetch into the local stor
 flwr list                                             # see what you have
 
 # 2. talk to it
-flwr run SmolLM2-135M-Instruct --gpu                  # interactive chat (Metal)
+flwr run SmolLM2-135M-Instruct                        # interactive chat (Metal on Apple Silicon)
 flwr run SmolLM2-135M-Instruct -p "Explain photosynthesis." -n 200   # one-shot
 
 # 3. serve an OpenAI-compatible API
-flwr serve SmolLM2-135M-Instruct --gpu --port 11434
+flwr serve SmolLM2-135M-Instruct --port 11434
 # then POST to http://127.0.0.1:11434/v1/chat/completions
 ```
 
@@ -78,8 +78,8 @@ and an HTTP server. Run `flwr` with no arguments for the built-in usage summary.
 ### Commands
 
 ```
-flwr run <model> [--gpu] [-p "prompt"] [-n N] [--temp T] [--seed S]
-flwr serve <model> [--gpu] [--host 127.0.0.1] [--port 11434]
+flwr run <model> [--cpu] [-p "prompt"] [-n N] [--temp T] [--seed S] [--think] [--effort low|medium|xhigh]
+flwr serve <model> [--cpu] [--host 127.0.0.1] [--port 11434]
 flwr pull <hf-repo | gguf-url> [--revision main] [--name X]
 flwr list
 flwr show <name>
@@ -118,7 +118,8 @@ The search path, in order:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--gpu` | off | Use the Metal GPU backend (macOS). No-op elsewhere. |
+| `--cpu` | — | Force the CPU path. On Apple Silicon the Metal GPU backend is the default; elsewhere CPU is the only path. |
+| `--think` / `--effort` | off / low | Reasoning models (qwen3.5): show the reasoning trace; `--effort low\|medium\|xhigh` sets its depth. Off by default. |
 | `-p, --prompt` | (none) | One-shot prompt instead of the interactive REPL. |
 | `-n, --n-predict` | 512 | Max tokens to generate. |
 | `--temp` | 0.7 | Sampling temperature. `0.0` = greedy. |
