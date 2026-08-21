@@ -70,6 +70,8 @@ fn usage() -> ! {
     eprintln!("flwr — talk to a model.   Powered by HOS.");
     eprintln!();
     eprintln!("  flwr run <model> [--cpu] [-p \"prompt\"] [-n N] [--temp T] [--seed S]");
+    eprintln!("                   [--think] [--effort low|medium|xhigh] [--hide-thinking]");
+    eprintln!("                   (reasoning models answer directly by default; --think shows their reasoning)");
     eprintln!("  flwr serve <model> [--cpu] [--host 127.0.0.1] [--port 11434]");
     eprintln!("  flwr pull <hf-repo|gguf-url> [--revision main] [--name X]");
     eprintln!("  flwr list");
