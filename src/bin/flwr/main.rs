@@ -890,7 +890,7 @@ fn find_sibling_mmproj(model: &Path) -> Option<String> {
 /// the shared memory + persistence helpers, so /role /list /open /continue all work.
 /// True if `path` is a `.hos` capsule whose card records `arch=qwen35` — so a
 /// minted (HF-ingested or GGUF-derived) qwen35 capsule routes to the hybrid loader.
-fn is_qwen35_capsule(path: &Path) -> bool {
+pub fn is_qwen35_capsule(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }

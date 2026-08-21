@@ -155,6 +155,26 @@ impl Backend {
                 .map(|sess| Backend::Gemma4 { sess, rng: 42 })
                 .map_err(|e| e.to_string());
         }
+        // qwen35 hybrid minted as a `.hos` capsule (HF ingest): HosSource is a
+        // generic ModelSource, same as `flwr run` uses. Sibling `.mmproj.hos`
+        // attaches the vision tower for the OpenAI image_url path.
+        if crate::is_qwen35_capsule(path) {
+            let (src, tok) = hos::hos_capsule::HosSource::open(path).map_err(|e| e.to_string())?;
+            let mut s = hos::qwen35::ChatSession::load(&src, tok, gpu).map_err(|e| e.to_string())?;
+            if let Some(mmp) = crate::find_sibling_mmproj(path) {
+                let mp = std::path::Path::new(&mmp);
+                let attached = if mmp.ends_with(".hos") {
+                    hos::hos_capsule::HosSource::open_source(mp).and_then(|vs| s.attach_vision(&vs))
+                } else {
+                    hos::gguf::Gguf::open(mp).and_then(|mg| s.attach_vision(&mg))
+                };
+                match attached {
+                    Ok(()) => eprintln!("    vision  mmproj attached ({mmp})"),
+                    Err(e) => eprintln!("    vision  mmproj load failed: {e}"),
+                }
+            }
+            return Ok(Backend::Qwen35(Box::new(s)));
+        }
         // qwen35 hybrid: a GGUF whose arch is the Gated-DeltaNet hybrid.
         if let Ok(g) = hos::gguf::Gguf::open(path) {
             if hos::model::Arch::detect(&g) == hos::model::Arch::Qwen35Hybrid {
