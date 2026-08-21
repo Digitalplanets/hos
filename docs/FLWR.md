@@ -93,6 +93,9 @@ flwr run my-model -p "Name three primary colors."   # one-shot, prints and exits
 | `--top-p <P>` | 0.95 | Nucleus cutoff. |
 | `--seed <S>` | 42 | RNG seed. |
 | `--gpu` | off | Use the Metal GPU backend (Apple Silicon, supported arches). |
+| `--think` | off | Reasoning models (qwen3.5): show the model's thinking before the answer. Off by default so a casual question gets an answer, not a reasoning trace. |
+| `--effort low\|medium\|xhigh` | low | Reasoning depth when thinking is on (implies `--think`). |
+| `--hide-thinking` | — | Reason, but print only the answer. |
 
 **REPL commands:** `/bye`, `/exit`, `/quit` end the session; `/reset` clears the
 in-memory conversation. Multi-turn history is kept in process and re-sent each
@@ -332,6 +335,15 @@ They're plain JSON files you can open, grep, version, or share.
 
 `messages` (required, array of `{role, content}`), plus optional `max_tokens`,
 `temperature`, `top_p`, `seed`, and `stream`.
+
+Reasoning models (qwen3.5) answer directly by default. `enable_thinking: true`
+turns the reasoning trace on (streamed as `reasoning_content`, OpenAI
+reasoning-model convention) and `reasoning_effort: "low" | "medium" | "xhigh"`
+sets its depth. The web UI exposes the same switch as the **think** toggle next
+to settings.
+
+`response_format: {"type": "json_object"}` requests JSON-constrained decoding
+(grammar-enforced on the llama-family engine; other backends ignore it).
 
 ### Examples
 
